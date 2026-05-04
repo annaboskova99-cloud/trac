@@ -147,6 +147,151 @@ async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text)
 
 
+# ══════════════════════════════════════════════════════════════
+# ЖИВАЯ ГЕОЛОКАЦИЯ + ПОГОДА
+# ══════════════════════════════════════════════════════════════
+import math
+
+# Хранилище активных трансляций: {user_id: {"lat", "lon", "last_weather", "chat_id"}}
+live_locations: dict[int, dict] = {}
+
+WEATHER_CHANGE_THRESHOLD = 50   # км — минимальный сдвиг для нового запроса
+SEVERE_CONDITIONS = {           # опасные условия — уведомлять сразу
+    "Thunderstorm", "Tornado", "Squall", "Snow", "Blizzard"
+}
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние между двумя точками в км."""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def get_weather_by_coords(lat: float, lon: float) -> dict | None:
+    """Запрашивает погоду по координатам."""
+    if not WEATHER_API_KEY:
+        return None
+    try:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/weather"
+            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}"
+            f"&units={WEATHER_UNITS}&lang=ru"
+        )
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return _json.loads(r.read())
+    except Exception as e:
+        log.warning(f"Погода по координатам: {e}")
+        return None
+
+
+def format_weather_coords(data: dict) -> str:
+    """Форматирует ответ погоды из данных API."""
+    unit = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+    city  = data.get("name", "Текущее местоположение")
+    main  = data["main"]
+    wind  = data["wind"]
+    cond  = data["weather"][0]
+    emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+    return (
+        f"📍 {city}\n"
+        f"{emoji} {cond['description'].capitalize()}\n"
+        f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
+        f"💧 Влажность: {main['humidity']}%\n"
+        f"💨 Ветер: {wind['speed']:.1f} {speed}"
+    )
+
+
+def is_severe(data: dict) -> bool:
+    """Проверяет опасные погодные условия."""
+    return data["weather"][0]["main"] in SEVERE_CONDITIONS
+
+
+async def handle_live_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает живую геолокацию от водителя."""
+    msg = update.message or update.edited_message
+    if not msg or not msg.location:
+        return
+
+    user_id = msg.from_user.id
+    chat_id = msg.chat_id
+    lat = msg.location.latitude
+    lon = msg.location.longitude
+
+    # Остановка трансляции
+    if getattr(msg.location, 'live_period', None) is None and user_id in live_locations:
+        del live_locations[user_id]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📍 Трансляция геолокации остановлена. Отслеживание погоды завершено."
+        )
+        return
+
+    prev = live_locations.get(user_id)
+
+    # Первая точка — всегда отправляем погоду
+    if not prev:
+        live_locations[user_id] = {
+            "lat": lat, "lon": lon,
+            "last_weather": None, "chat_id": chat_id
+        }
+        data = get_weather_by_coords(lat, lon)
+        if data:
+            live_locations[user_id]["last_weather"] = data["weather"][0]["main"]
+            text = (
+                "🚛 Начало отслеживания маршрута\n\n"
+                + format_weather_coords(data)
+            )
+            if is_severe(data):
+                text += "\n\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Рекомендуем остановиться."
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    # Считаем сдвиг
+    dist = haversine_km(prev["lat"], prev["lon"], lat, lon)
+    prev_condition = prev.get("last_weather")
+
+    # Обновляем координаты
+    live_locations[user_id]["lat"] = lat
+    live_locations[user_id]["lon"] = lon
+
+    # Запрашиваем погоду если сдвиг > порога
+    if dist < WEATHER_CHANGE_THRESHOLD:
+        return
+
+    data = get_weather_by_coords(lat, lon)
+    if not data:
+        return
+
+    new_condition = data["weather"][0]["main"]
+    severe = is_severe(data)
+
+    # Отправляем если: погода изменилась ИЛИ опасные условия
+    if new_condition != prev_condition or severe:
+        live_locations[user_id]["last_weather"] = new_condition
+        text = f"📍 Обновление погоды — проехали {dist:.0f} км\n\n" + format_weather_coords(data)
+        if severe:
+            text += "\n\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Рекомендуем остановиться."
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def cmd_liveweather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инструкция как включить живую геолокацию."""
+    await update.message.reply_text(
+        "🗺 Как включить отслеживание погоды по маршруту:\n\n"
+        "1. Нажмите скрепку 📎 в чате\n"
+        "2. Выберите Location (Геолокация)\n"
+        "3. Нажмите Share Live Location (Живая геолокация)\n"
+        "4. Выберите время: 1ч / 8ч / пока не остановлю\n\n"
+        "Бот будет автоматически присылать погоду при:\n"
+        "• Смене погодных условий\n"
+        "• Опасной погоде (гроза, снег, шторм)\n"
+        "• Каждые 50 км пути"
+    )
+
+
 def init_db():
     with get_conn() as conn:
         conn.executescript("""
@@ -751,6 +896,10 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("weather", cmd_weather))
+    app.add_handler(CommandHandler("liveweather", cmd_liveweather))
+    # Живая геолокация — оба события: новая и обновлённая
+    app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_live_location))
     app.add_handler(build_conv())
 
     app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"),   sec_drivers))
