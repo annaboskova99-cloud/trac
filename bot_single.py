@@ -71,12 +71,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS schedules (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             title      TEXT NOT NULL,
-            text       TEXT NOT NULL,
+            text       TEXT,
             cron_expr  TEXT NOT NULL,
             target     TEXT NOT NULL,
             active     INTEGER DEFAULT 1,
+            photo_id   TEXT,
+            doc_id     TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
+        -- Миграция: добавляем колонки если их нет
+        
         CREATE TABLE IF NOT EXISTS send_log (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id  INTEGER NOT NULL,
@@ -85,6 +89,15 @@ def init_db():
             source   TEXT
         );
         """)
+        # Миграция: добавляем колонки если их нет
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(schedules)").fetchall()]
+            if "photo_id" not in cols:
+                conn.execute("ALTER TABLE schedules ADD COLUMN photo_id TEXT")
+            if "doc_id" not in cols:
+                conn.execute("ALTER TABLE schedules ADD COLUMN doc_id TEXT")
+        except Exception:
+            pass
         if conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0] == 0:
             conn.executemany("INSERT INTO templates (title, text) VALUES (?, ?)", [
                 ("PTI напоминание",
@@ -161,11 +174,11 @@ def get_schedule(sid):
     with get_conn() as conn:
         return conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
 
-def add_schedule(title, text, cron_expr, target):
+def add_schedule(title, text, cron_expr, target, photo_id=None, doc_id=None):
     with get_conn() as conn:
         return conn.execute(
-            "INSERT INTO schedules (title,text,cron_expr,target) VALUES (?,?,?,?)",
-            (title, text, cron_expr, target)
+            "INSERT INTO schedules (title,text,cron_expr,target,photo_id,doc_id) VALUES (?,?,?,?,?,?)",
+            (title, text, cron_expr, target, photo_id, doc_id)
         ).lastrowid
 
 def update_schedule(sid, **kw):
@@ -216,10 +229,17 @@ async def job_send_scheduled(context: ContextTypes.DEFAULT_TYPE):
         return
     chat_ids = [d["chat_id"] for d in get_all_drivers()] if s["target"] == "all" \
         else [int(x) for x in s["target"].split(",") if x.strip()]
+    photo_id = s["photo_id"] if "photo_id" in s.keys() else None
+    doc_id   = s["doc_id"]   if "doc_id"   in s.keys() else None
     for cid in chat_ids:
         try:
-            await context.bot.send_message(chat_id=cid, text=s["text"])
-            log_send(cid, s["text"], "schedule")
+            if photo_id:
+                await context.bot.send_photo(chat_id=cid, photo=photo_id, caption=s["text"] or "")
+            elif doc_id:
+                await context.bot.send_document(chat_id=cid, document=doc_id, caption=s["text"] or "")
+            else:
+                await context.bot.send_message(chat_id=cid, text=s["text"])
+            log_send(cid, s["text"] or "", "schedule")
         except Exception as e:
             log.warning(f"Расписание #{sid} → {cid}: {e}")
 
@@ -465,7 +485,15 @@ async def st_sch_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_SCH_TEXT
 
 async def st_sch_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["sch_text"] = update.message.text.strip()
+    # Поддержка фото/файла как контент уведомления
+    if update.message.photo:
+        context.user_data["sch_photo"] = update.message.photo[-1].file_id
+        context.user_data["sch_text"] = update.message.caption or ""
+    elif update.message.document:
+        context.user_data["sch_doc"] = update.message.document.file_id
+        context.user_data["sch_text"] = update.message.caption or ""
+    else:
+        context.user_data["sch_text"] = update.message.text.strip()
     await update.message.reply_text(
         "Введите расписание:\n\n"
         "<code>09:00</code> — каждый день\n"
@@ -491,6 +519,8 @@ async def st_sch_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("sch_text", ""),
         context.user_data.pop("sch_cron", "09:00"),
         "all" if target == "all" else target,
+        photo_id=context.user_data.pop("sch_photo", None),
+        doc_id=context.user_data.pop("sch_doc", None),
     )
     register_schedule(context.application, dict(get_schedule(sid)))
     await q.message.reply_text("✅ Расписание создано.", reply_markup=kb_main_op())
@@ -606,7 +636,7 @@ def build_conv():
             ST_TPL_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_tpl_title)],
             ST_TPL_TEXT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_tpl_text)],
             ST_SCH_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_sch_title)],
-            ST_SCH_TEXT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_sch_text)],
+            ST_SCH_TEXT:  [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, st_sch_text)],
             ST_SCH_CRON:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_sch_cron)],
             ST_SCH_TARGET:[CallbackQueryHandler(st_sch_target, pattern=r"^target_")],
             ST_BC_TEXT:   [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, st_bc_text)],
