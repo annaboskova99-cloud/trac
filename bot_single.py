@@ -26,6 +26,9 @@ OPERATOR_IDS = [int(x) for x in os.getenv("OPERATOR_IDS", "123456789").split(","
 DB_PATH      = os.getenv("DB_PATH", "/app/data/trucking.db")
 TEST_MODE    = os.getenv("TEST_MODE", "false").lower() == "true"
 
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
+WEATHER_UNITS   = "imperial"  # imperial = °F, metric = °C
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -49,6 +52,99 @@ def get_conn():
         raise
     finally:
         conn.close()
+
+
+
+# ══════════════════════════════════════════════════════════════
+# ПОГОДА
+# ══════════════════════════════════════════════════════════════
+import urllib.request
+import json as _json
+
+WEATHER_EMOJI = {
+    "Clear": "☀️", "Clouds": "☁️", "Rain": "🌧️",
+    "Drizzle": "🌦️", "Thunderstorm": "⛈️", "Snow": "❄️",
+    "Mist": "🌫️", "Fog": "🌫️", "Haze": "🌫️",
+}
+
+def _fetch_weather(city: str) -> dict:
+    url = (
+        f"https://api.openweathermap.org/data/2.5/weather"
+        f"?q={urllib.request.quote(city)}&appid={WEATHER_API_KEY}"
+        f"&units={WEATHER_UNITS}&lang=ru"
+    )
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return _json.loads(r.read())
+
+def _fetch_forecast(city: str) -> dict:
+    url = (
+        f"https://api.openweathermap.org/data/2.5/forecast"
+        f"?q={urllib.request.quote(city)}&appid={WEATHER_API_KEY}"
+        f"&units={WEATHER_UNITS}&lang=ru&cnt=24"
+    )
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return _json.loads(r.read())
+
+def format_weather(city: str) -> str:
+    if not WEATHER_API_KEY:
+        return "⚠️ WEATHER_API_KEY не настроен. Добавьте ключ в переменные окружения."
+    unit = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+    try:
+        w = _fetch_weather(city)
+        main   = w["main"]
+        wind   = w["wind"]
+        cond   = w["weather"][0]
+        emoji  = WEATHER_EMOJI.get(cond["main"], "🌡️")
+        city_name = w["name"]
+
+        lines = [
+            f"{emoji} Погода в {city_name}",
+            f"🌡 {main['temp']:.0f}{unit}, ощущается как {main['feels_like']:.0f}{unit}",
+            f"💧 Влажность: {main['humidity']}%",
+            f"💨 Ветер: {wind['speed']:.1f} {speed}",
+            f"🌥 {cond['description'].capitalize()}",
+            "",
+            "📅 Прогноз на 3 дня:",
+        ]
+
+        # Прогноз
+        fc = _fetch_forecast(city)
+        seen_days = set()
+        for item in fc["list"]:
+            dt = datetime.fromtimestamp(item["dt"])
+            day = dt.strftime("%a %d.%m")
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            if len(seen_days) > 3:
+                break
+            t    = item["main"]["temp"]
+            desc = item["weather"][0]["description"]
+            em   = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
+            lines.append(f"{em} {day}: {t:.0f}{unit} — {desc}")
+
+        return "\n".join(lines)
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return f"❌ Город «{city}» не найден. Попробуйте на английском: /weather New York"
+        return f"❌ Ошибка погодного сервиса: {e}"
+    except Exception as e:
+        return f"❌ Не удалось получить погоду: {e}"
+
+
+async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Укажите город: /weather New York\n"
+            "Или: /weather Chicago"
+        )
+        return
+    city = " ".join(context.args)
+    msg  = await update.message.reply_text("⏳ Получаю погоду...")
+    text = format_weather(city)
+    await msg.edit_text(text)
 
 
 def init_db():
@@ -654,6 +750,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("weather", cmd_weather))
     app.add_handler(build_conv())
 
     app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"),   sec_drivers))
