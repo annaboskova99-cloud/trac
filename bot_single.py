@@ -193,6 +193,8 @@ def parse_cron(expr):
         return {"type": "interval", "seconds": int(t[2:-1]) * 3600}
     if t.startswith("*/") and t.endswith("m"):
         return {"type": "interval", "seconds": int(t[2:-1]) * 60}
+    if ":" not in t:
+        raise ValueError(f"Неверный формат: '{expr}'. Используйте 09:00, */4h или */10m")
     hh, mm = map(int, t.split(":"))
     r = {"type": "daily", "time": dtime(hour=hh, minute=mm)}
     if extra:
@@ -243,7 +245,11 @@ def unregister_schedule(app, sid):
 
 def register_all_schedules(app):
     for s in get_schedules(active_only=True):
-        register_schedule(app, dict(s))
+        try:
+            register_schedule(app, dict(s))
+        except (ValueError, Exception) as e:
+            log.warning(f"Расписание #{s['id']} пропущено ({s['cron_expr']}): {e}")
+            delete_schedule(s['id'])
 
 
 # ══════════════════════════════════════════════════════════════
