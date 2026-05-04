@@ -13,7 +13,7 @@ from config import BOT_TOKEN
 from db.database import init_db
 from scheduler.jobs import register_all_schedules
 from handlers.common import is_operator, kb_operator_main
-from handlers.operator import (
+from handlers.operator_panel import (
     cmd_operator, section_drivers, section_templates,
     section_schedules, cb_navigation, build_operator_conv,
     cb_driver_edit, cb_driver_toggle, cb_driver_delete,
