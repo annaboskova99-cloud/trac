@@ -1122,6 +1122,9 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    log.info(f"auto_detect_trip: получено сообщение от {msg.from_user.id} в чате {msg.chat_id}, тип чата: {msg.chat.type}")
+    log.info(f"auto_detect_trip: текст[:100] = {repr(text[:100])}")
+
     # Нормализуем unicode (𝗧𝗿𝗶𝗽 → Trip, жирные/курсивные символы → обычные)
     import unicodedata
     normalized = unicodedata.normalize("NFKD", text)
@@ -1170,7 +1173,9 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Preloaded", "preloaded",
         "Drop", "Pickup",
     ]
-    if not any(kw.lower() in clean_text.lower() for kw in keywords):
+    matched = [kw for kw in keywords if kw.lower() in clean_text.lower()]
+    log.info(f"auto_detect_trip: совпавшие ключевые слова: {matched}")
+    if not matched:
         return
 
     # Сохраняем оригинальный текст для AI парсера
