@@ -746,6 +746,22 @@ def drivers_target_kb():
 # ══════════════════════════════════════════════════════════════
 
 # ── /start ───────────────────────────────────────────────────
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает Telegram ID пользователя."""
+    uid = update.effective_user.id
+    name = update.effective_user.full_name
+    is_operator = is_op(uid)
+    await update.message.reply_text(
+        f"👤 Ваш Telegram ID: <code>{uid}</code>\n"
+        f"Имя: {name}\n"
+        f"Оператор: {'✅ Да' if is_operator else '❌ Нет'}\n\n"
+        f"Текущий OPERATOR_IDS: <code>{OPERATOR_IDS}</code>\n\n"
+        + ("Кнопки должны работать!" if is_operator else
+           f"⚠️ Добавьте <code>{uid}</code> в OPERATOR_IDS на Bothost и сделайте Restart."),
+        parse_mode="HTML"
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if is_op(uid):
@@ -1097,8 +1113,16 @@ def build_conv():
 
 async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Автоматически определяет сообщение с маршрутом и предлагает погоду."""
-    text = update.message.text or ""
-    keywords = ["Trip ID", "trip id", "TRIP ID", "Loaded -", "Per mile:", "Duration:"]
+    msg = update.message
+    if not msg:
+        return
+
+    # Поддержка обычных и пересланных сообщений
+    text = msg.text or msg.caption or ""
+    if not text:
+        return
+
+    keywords = ["Trip ID", "trip id", "TRIP ID", "Loaded -", "Per mile:", "Duration:", "Preloaded", "Drop"]
     if not any(kw in text for kw in keywords):
         return
     await update.message.reply_text(
@@ -1182,9 +1206,14 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("weather", cmd_weather))
     app.add_handler(CommandHandler("parsetrip", cmd_parsetrip))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect_trip))
+    # Обычные и пересланные сообщения с маршрутом
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
+        auto_detect_trip
+    ))
     app.add_handler(CallbackQueryHandler(cb_autotrip, pattern=r"^autotrip_"))
     # Живая геолокация — оба события: новая и обновлённая
     app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
