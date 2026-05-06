@@ -59,6 +59,7 @@ def get_conn():
 # ══════════════════════════════════════════════════════════════
 # ПОГОДА
 # ══════════════════════════════════════════════════════════════
+import asyncio
 import urllib.request
 import json as _json
 
@@ -376,39 +377,55 @@ async def extract_cities_ai(text: str) -> list[str] | None:
     """Извлекает города из произвольного текста через Gemini API."""
     if not GEMINI_API_KEY:
         return None
-    try:
-        prompt = (
-            "Extract all city names with state/country from this shipping/trucking message. "
-            "Return ONLY a JSON array of city strings in route order, nothing else. "
-            "Example: [\"San Bernardino, CA\", \"Teterboro, NJ\"]\n\n"
-            f"Message:\n{text}"
-        )
-        payload = _json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 200, "temperature": 0}
-        }).encode()
 
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models"
-            f"/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        )
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = _json.loads(r.read())
+    prompt = (
+        "Extract all city names with state/country from this shipping/trucking message. "
+        "Return ONLY a JSON array of city strings in route order, nothing else. "
+        "Example: [\"San Bernardino, CA\", \"Teterboro, NJ\"]\n\n"
+        f"Message:\n{text}"
+    )
+    payload = _json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 0}
+    }).encode()
 
-        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Убираем markdown если есть
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        cities = _json.loads(raw)
-        if isinstance(cities, list) and len(cities) >= 2:
-            return cities
-    except Exception as e:
-        log.warning(f"Gemini парсер: {e}")
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models"
+        f"/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    # Повтор при 429 (лимит запросов) — до 3 попыток
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = _json.loads(r.read())
+
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            cities = _json.loads(raw)
+            if isinstance(cities, list) and len(cities) >= 2:
+                return cities
+            return None
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = 5 * (attempt + 1)  # 5, 10, 15 секунд
+                log.warning(f"Gemini 429 — жду {wait}с (попытка {attempt+1}/3)")
+                await asyncio.sleep(wait)
+            else:
+                log.warning(f"Gemini парсер HTTP {e.code}: {e}")
+                return None
+        except Exception as e:
+            log.warning(f"Gemini парсер: {e}")
+            return None
+
+    log.warning("Gemini: все попытки исчерпаны")
     return None
 
 
