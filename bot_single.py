@@ -1209,21 +1209,28 @@ def main():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("weather", cmd_weather))
     app.add_handler(CommandHandler("parsetrip", cmd_parsetrip))
-    # Обычные и пересланные сообщения с маршрутом
+
+    # ── Сначала ConversationHandler-ы ────────────────────────
+    app.add_handler(build_route_conv())
+    app.add_handler(build_conv())
+
+    # ── Кнопки меню оператора (приоритет выше auto_detect) ───
+    app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"),   sec_drivers))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Шаблоны$"),    sec_templates))
+    app.add_handler(MessageHandler(filters.Regex("^🕐 Расписания$"), sec_schedules))
+
+    # ── Inline callbacks ──────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(cb_autotrip, pattern=r"^autotrip_"))
+
+    # ── Геолокация ────────────────────────────────────────────
+    app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_live_location))
+
+    # ── Автодетект маршрута — ПОСЛЕДНИМ чтобы не перехватывать кнопки ──
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
         auto_detect_trip
     ))
-    app.add_handler(CallbackQueryHandler(cb_autotrip, pattern=r"^autotrip_"))
-    # Живая геолокация — оба события: новая и обновлённая
-    app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
-    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_live_location))
-    app.add_handler(build_route_conv())
-    app.add_handler(build_conv())
-
-    app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"),   sec_drivers))
-    app.add_handler(MessageHandler(filters.Regex("^📋 Шаблоны$"),    sec_templates))
-    app.add_handler(MessageHandler(filters.Regex("^🕐 Расписания$"), sec_schedules))
 
     app.add_handler(CallbackQueryHandler(cb_drv_edit,   pattern=r"^drv_edit_-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_drv_toggle, pattern=r"^drv_toggle_-?\d+$"))
