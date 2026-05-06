@@ -26,7 +26,8 @@ OPERATOR_IDS = [int(x) for x in os.getenv("OPERATOR_IDS", "123456789").split(","
 DB_PATH      = os.getenv("DB_PATH", "/app/data/trucking.db")
 TEST_MODE    = os.getenv("TEST_MODE", "false").lower() == "true"
 
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
+WEATHER_API_KEY   = os.getenv("WEATHER_API_KEY", "")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 WEATHER_UNITS   = "imperial"  # imperial = °F, metric = °C
 
 logging.basicConfig(
@@ -277,18 +278,213 @@ async def handle_live_location(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(chat_id=chat_id, text=text)
 
 
+# Хранилище маршрутов: {user_id: {"destination": str, "waypoints": [str]}}
+route_data: dict[int, dict] = {}
+
+ROUTE_CONV_SET_DEST = 900
+
 async def cmd_liveweather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Инструкция как включить живую геолокацию."""
+    """Запрашивает маршрут перед стартом трансляции."""
     await update.message.reply_text(
-        "🗺 Как включить отслеживание погоды по маршруту:\n\n"
-        "1. Нажмите скрепку 📎 в чате\n"
-        "2. Выберите Location (Геолокация)\n"
-        "3. Нажмите Share Live Location (Живая геолокация)\n"
-        "4. Выберите время: 1ч / 8ч / пока не остановлю\n\n"
-        "Бот будет автоматически присылать погоду при:\n"
-        "• Смене погодных условий\n"
-        "• Опасной погоде (гроза, снег, шторм)\n"
-        "• Каждые 50 км пути"
+        "🗺 Укажите маршрут в формате:\n\n"
+        "<code>New York / Cleveland / Chicago</code>\n\n"
+        "Первый город — промежуточные — последний город назначения.\n"
+        "Можно без промежуточных: <code>New York / Chicago</code>",
+        parse_mode="HTML"
+    )
+    return ROUTE_CONV_SET_DEST
+
+
+async def st_route_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает маршрут, показывает погоду по всем точкам."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    cities = [c.strip() for c in text.split("/") if c.strip()]
+    if len(cities) < 2:
+        await update.message.reply_text(
+            "Нужно минимум 2 города. Пример:\n<code>New York / Chicago</code>",
+            parse_mode="HTML"
+        )
+        return ROUTE_CONV_SET_DEST
+
+    route_data[user_id] = {"cities": cities, "chat_id": chat_id}
+
+    # Отправляем погоду по всем точкам маршрута
+    await update.message.reply_text(
+        f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду по всем точкам..."
+    )
+
+    for i, city in enumerate(cities):
+        try:
+            data = _fetch_weather(city)
+            if i == 0:
+                label = f"🚦 Старт — {city}"
+            elif i == len(cities) - 1:
+                label = f"🏁 Финиш — {city}"
+            else:
+                label = f"📍 Промежуток — {city}"
+
+            unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+            speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+            cond  = data["weather"][0]
+            main  = data["main"]
+            wind  = data["wind"]
+            emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+            severe_warn = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
+
+            msg = (
+                f"{label}\n"
+                f"{emoji} {cond['description'].capitalize()}\n"
+                f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
+                f"💧 Влажность: {main['humidity']}%\n"
+                f"💨 Ветер: {wind['speed']:.1f} {speed}"
+                f"{severe_warn}"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось получить погоду для {city}: {e}"
+            )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ Сводка по маршруту готова!\n\n"
+            "Теперь включите живую геолокацию:\n"
+            "📎 Скрепка → Location → Share Live Location\n"
+            "Бот будет следить за погодой в пути автоматически."
+        )
+    )
+    return ConversationHandler.END
+
+
+async def conv_route_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════
+# AI ПАРСЕР МАРШРУТА (Claude API)
+# ══════════════════════════════════════════════════════════════
+import urllib.error
+
+async def extract_cities_ai(text: str) -> list[str] | None:
+    """Извлекает города из произвольного текста через Gemini API."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        prompt = (
+            "Extract all city names with state/country from this shipping/trucking message. "
+            "Return ONLY a JSON array of city strings in route order, nothing else. "
+            "Example: [\"San Bernardino, CA\", \"Teterboro, NJ\"]\n\n"
+            f"Message:\n{text}"
+        )
+        payload = _json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 200, "temperature": 0}
+        }).encode()
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models"
+            f"/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        )
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = _json.loads(r.read())
+
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Убираем markdown если есть
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        cities = _json.loads(raw)
+        if isinstance(cities, list) and len(cities) >= 2:
+            return cities
+    except Exception as e:
+        log.warning(f"Gemini парсер: {e}")
+    return None
+
+
+async def cmd_parsetrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Парсит сообщение с маршрутом и отправляет погоду."""
+    # Текст может быть в args или в reply
+    if context.args:
+        trip_text = " ".join(context.args)
+    elif update.message.reply_to_message and update.message.reply_to_message.text:
+        trip_text = update.message.reply_to_message.text
+    else:
+        await update.message.reply_text(
+            "Перешлите сообщение с маршрутом и ответьте на него командой /parsetrip\n\n"
+            "Или отправьте: /parsetrip <текст маршрута>"
+        )
+        return
+
+    msg = await update.message.reply_text("🔍 Анализирую маршрут...")
+
+    # Пробуем AI парсер
+    cities = await extract_cities_ai(trip_text)
+
+    if not cities:
+        await msg.edit_text(
+            "❌ Не удалось извлечь маршрут.\n\n"
+            "Добавьте GEMINI_API_KEY в переменные окружения на Bothost."
+        )
+        return
+
+    await msg.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду...")
+
+    chat_id = update.effective_chat.id
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+
+    for i, city in enumerate(cities):
+        try:
+            data = _fetch_weather(city)
+            if i == 0:
+                label = f"🚦 Старт — {city}"
+            elif i == len(cities) - 1:
+                label = f"🏁 Финиш — {city}"
+            else:
+                label = f"📍 Промежуток — {city}"
+
+            cond  = data["weather"][0]
+            main  = data["main"]
+            wind  = data["wind"]
+            emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+            warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Будьте осторожны." if cond["main"] in SEVERE_CONDITIONS else ""
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{label}\n"
+                    f"{emoji} {cond['description'].capitalize()}\n"
+                    f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
+                    f"💧 Влажность: {main['humidity']}%\n"
+                    f"💨 Ветер: {wind['speed']:.1f} {speed}"
+                    f"{warn}"
+                )
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось получить погоду для {city}"
+            )
+            log.warning(f"parsetrip weather error for {city}: {e}")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ Сводка по маршруту готова!\n\n"
+            "Хотите отслеживать погоду в пути?\n"
+            "Используйте /liveweather"
+        )
     )
 
 
@@ -862,6 +1058,17 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════
 # СБОРКА И ЗАПУСК
 # ══════════════════════════════════════════════════════════════
+def build_route_conv():
+    return ConversationHandler(
+        entry_points=[CommandHandler("liveweather", cmd_liveweather)],
+        states={
+            ROUTE_CONV_SET_DEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_route_dest)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_route_cancel)],
+        per_user=True, per_chat=False,
+    )
+
+
 def build_conv():
     return ConversationHandler(
         entry_points=[
@@ -888,6 +1095,86 @@ def build_conv():
     )
 
 
+async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Автоматически определяет сообщение с маршрутом и предлагает погоду."""
+    text = update.message.text or ""
+    keywords = ["Trip ID", "trip id", "TRIP ID", "Loaded -", "Per mile:", "Duration:"]
+    if not any(kw in text for kw in keywords):
+        return
+    await update.message.reply_text(
+        "🚛 Вижу сообщение с маршрутом!\n"
+        "Отправить погоду по всем точкам маршрута?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, показать погоду", callback_data=f"autotrip_{update.message.message_id}"),
+            InlineKeyboardButton("❌ Нет", callback_data="autotrip_cancel"),
+        ]])
+    )
+    # Сохраняем текст для последующей обработки
+    context.bot_data[f"trip_msg_{update.message.message_id}"] = {
+        "text": text,
+        "chat_id": update.effective_chat.id,
+    }
+
+
+async def cb_autotrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает подтверждение автопарсинга маршрута."""
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "autotrip_cancel":
+        await q.message.delete()
+        return
+
+    msg_id = q.data.replace("autotrip_", "")
+    saved  = context.bot_data.get(f"trip_msg_{msg_id}")
+    if not saved:
+        await q.message.edit_text("❌ Сообщение не найдено. Попробуйте /parsetrip")
+        return
+
+    await q.message.edit_text("🔍 Анализирую маршрут...")
+    cities = await extract_cities_ai(saved["text"])
+
+    if not cities:
+        await q.message.edit_text(
+            "❌ Не удалось извлечь маршрут.\n"
+            "Убедитесь что добавлен GEMINI_API_KEY на Bothost."
+        )
+        return
+
+    await q.message.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду...")
+
+    chat_id = saved["chat_id"]
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+
+    for i, city in enumerate(cities):
+        try:
+            data = _fetch_weather(city)
+            label = ("🚦 Старт" if i == 0 else "🏁 Финиш" if i == len(cities)-1 else "📍 Промежуток")
+            cond  = data["weather"][0]
+            main  = data["main"]
+            wind  = data["wind"]
+            emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+            warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{label} — {city}\n"
+                    f"{emoji} {cond['description'].capitalize()}\n"
+                    f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
+                    f"💧 Влажность: {main['humidity']}%\n"
+                    f"💨 Ветер: {wind['speed']:.1f} {speed}{warn}"
+                )
+            )
+        except Exception as e:
+            log.warning(f"autotrip weather {city}: {e}")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="✅ Готово! Для отслеживания в пути используйте /liveweather"
+    )
+
+
 def main():
     init_db()
     log.info("БД инициализирована.")
@@ -896,10 +1183,13 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("weather", cmd_weather))
-    app.add_handler(CommandHandler("liveweather", cmd_liveweather))
+    app.add_handler(CommandHandler("parsetrip", cmd_parsetrip))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect_trip))
+    app.add_handler(CallbackQueryHandler(cb_autotrip, pattern=r"^autotrip_"))
     # Живая геолокация — оба события: новая и обновлённая
     app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, handle_live_location))
+    app.add_handler(build_route_conv())
     app.add_handler(build_conv())
 
     app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"),   sec_drivers))
