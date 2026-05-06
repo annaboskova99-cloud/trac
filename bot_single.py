@@ -1122,9 +1122,59 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    keywords = ["Trip ID", "trip id", "TRIP ID", "Loaded -", "Per mile:", "Duration:", "Preloaded", "Drop"]
-    if not any(kw in text for kw in keywords):
+    # Нормализуем unicode (𝗧𝗿𝗶𝗽 → Trip, жирные/курсивные символы → обычные)
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", text)
+    # Дополнительно убираем unicode bold/italic диапазоны вручную
+    def strip_unicode_style(s):
+        result = []
+        for ch in s:
+            cp = ord(ch)
+            # Bold serif: 𝗔-𝘇 (U+1D400-U+1D7FF)
+            if 0x1D400 <= cp <= 0x1D7FF:
+                # Маппинг на обычные ASCII
+                offsets = [
+                    (0x1D400, 0x1D419, 65),   # Bold A-Z
+                    (0x1D41A, 0x1D433, 97),   # Bold a-z
+                    (0x1D434, 0x1D44D, 65),   # Italic A-Z
+                    (0x1D44E, 0x1D467, 97),   # Italic a-z
+                    (0x1D468, 0x1D481, 65),   # Bold Italic A-Z
+                    (0x1D482, 0x1D49B, 97),   # Bold Italic a-z
+                    (0x1D49C, 0x1D4B5, 65),   # Script A-Z
+                    (0x1D5D4, 0x1D5ED, 65),   # Bold Sans A-Z
+                    (0x1D5EE, 0x1D607, 97),   # Bold Sans a-z
+                    (0x1D608, 0x1D621, 65),   # Italic Sans A-Z
+                    (0x1D622, 0x1D63B, 97),   # Italic Sans a-z
+                    (0x1D63C, 0x1D655, 65),   # Bold Italic Sans A-Z
+                    (0x1D656, 0x1D66F, 97),   # Bold Italic Sans a-z
+                ]
+                converted = False
+                for start, end, base in offsets:
+                    if start <= cp <= end:
+                        result.append(chr(base + cp - start))
+                        converted = True
+                        break
+                if not converted:
+                    result.append(ch)
+            else:
+                result.append(ch)
+        return "".join(result)
+
+    clean_text = strip_unicode_style(normalized)
+
+    keywords = [
+        "Trip ID", "trip id", "TRIP ID",
+        "Loaded -", "Loaded-",
+        "Per mile", "per mile",
+        "Duration", "duration",
+        "Preloaded", "preloaded",
+        "Drop", "Pickup",
+    ]
+    if not any(kw.lower() in clean_text.lower() for kw in keywords):
         return
+
+    # Сохраняем оригинальный текст для AI парсера
+    text = clean_text
     await update.message.reply_text(
         "🚛 Вижу сообщение с маршрутом!\n"
         "Отправить погоду по всем точкам маршрута?",
@@ -1135,7 +1185,7 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     # Сохраняем текст для последующей обработки
     context.bot_data[f"trip_msg_{update.message.message_id}"] = {
-        "text": text,
+        "text": clean_text,
         "chat_id": update.effective_chat.id,
     }
 
