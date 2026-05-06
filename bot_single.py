@@ -87,6 +87,59 @@ def _fetch_forecast(city: str) -> dict:
     with urllib.request.urlopen(url, timeout=5) as r:
         return _json.loads(r.read())
 
+def format_weather_full(city: str, label: str = "") -> str:
+    """Погода + прогноз на 3 дня для одного города."""
+    if not WEATHER_API_KEY:
+        return "⚠️ WEATHER_API_KEY не настроен."
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+    try:
+        w     = _fetch_weather(city)
+        main  = w["main"]
+        wind  = w["wind"]
+        cond  = w["weather"][0]
+        emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+        city_name = w["name"]
+        warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
+
+        header = f"{label} — {city_name}" if label else city_name
+        lines = [
+            f"{emoji} {header}",
+            f"🌡 Сейчас: {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
+            f"💧 Влажность: {main['humidity']}%",
+            f"💨 Ветер: {wind['speed']:.1f} {speed}",
+            f"🌥 {cond['description'].capitalize()}{warn}",
+            "",
+            "📅 Прогноз на 3 дня:",
+        ]
+
+        fc = _fetch_forecast(city)
+        seen_days = set()
+        for item in fc["list"]:
+            dt  = datetime.fromtimestamp(item["dt"])
+            day = dt.strftime("%a %d.%m")
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            if len(seen_days) > 3:
+                break
+            t    = item["main"]["temp"]
+            t_min = item["main"]["temp_min"]
+            t_max = item["main"]["temp_max"]
+            desc  = item["weather"][0]["description"]
+            em    = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
+            lines.append(f"{em} {day}: {t_max:.0f}/{t_min:.0f}{unit} — {desc}")
+
+        return "\n".join(lines)
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return f"❌ Город «{city}» не найден."
+        return f"❌ Ошибка сервиса погоды: {e}"
+    except Exception as e:
+        return f"❌ Не удалось получить погоду для {city}: {e}"
+
+
 def format_weather(city: str) -> str:
     if not WEATHER_API_KEY:
         return "⚠️ WEATHER_API_KEY не настроен. Добавьте ключ в переменные окружения."
@@ -110,7 +163,6 @@ def format_weather(city: str) -> str:
             "📅 Прогноз на 3 дня:",
         ]
 
-        # Прогноз
         fc = _fetch_forecast(city)
         seen_days = set()
         for item in fc["list"]:
@@ -373,59 +425,40 @@ async def conv_route_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════
 import urllib.error
 
+def extract_cities_regex(text: str) -> list[str]:
+    """Извлекает города из текста маршрута без AI — через regex."""
+    import re
+
+    # Ищем паттерны вида "City, ST" или "City, ST ZIP"
+    pattern = re.compile(
+        r"([A-Z][a-zA-Z\s\.\-]+),\s*([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?",
+        re.MULTILINE
+    )
+    matches = pattern.findall(text)
+    cities = []
+    seen = set()
+    for city, state in matches:
+        city = city.strip()
+        # Убираем мусор — короткие слова, коды складов
+        if len(city) < 3:
+            continue
+        # Убираем строки типа "ONT5", "EWR8" — коды складов Amazon
+        if re.match(r"^[A-Z]{2,4}\d+$", city):
+            continue
+        key = f"{city}, {state}"
+        if key not in seen:
+            seen.add(key)
+            cities.append(key)
+    return cities
+
+
 async def extract_cities_ai(text: str) -> list[str] | None:
-    """Извлекает города из произвольного текста через Gemini API."""
-    if not GEMINI_API_KEY:
-        return None
-
-    prompt = (
-        "Extract all city names with state/country from this shipping/trucking message. "
-        "Return ONLY a JSON array of city strings in route order, nothing else. "
-        "Example: [\"San Bernardino, CA\", \"Teterboro, NJ\"]\n\n"
-        f"Message:\n{text}"
-    )
-    payload = _json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 200, "temperature": 0}
-    }).encode()
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models"
-        f"/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    )
-
-    # Повтор при 429 (лимит запросов) — до 3 попыток
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = _json.loads(r.read())
-
-            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            cities = _json.loads(raw)
-            if isinstance(cities, list) and len(cities) >= 2:
-                return cities
-            return None
-
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = 5 * (attempt + 1)  # 5, 10, 15 секунд
-                log.warning(f"Gemini 429 — жду {wait}с (попытка {attempt+1}/3)")
-                await asyncio.sleep(wait)
-            else:
-                log.warning(f"Gemini парсер HTTP {e.code}: {e}")
-                return None
-        except Exception as e:
-            log.warning(f"Gemini парсер: {e}")
-            return None
-
-    log.warning("Gemini: все попытки исчерпаны")
+    """Извлекает города из текста — сначала regex, без AI."""
+    cities = extract_cities_regex(text)
+    if len(cities) >= 2:
+        log.info(f"Regex парсер нашёл города: {cities}")
+        return cities
+    log.warning(f"Regex не нашёл городов в тексте")
     return None
 
 
@@ -458,50 +491,15 @@ async def cmd_parsetrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду...")
 
     chat_id = update.effective_chat.id
-    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
-    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
 
     for i, city in enumerate(cities):
-        try:
-            data = _fetch_weather(city)
-            if i == 0:
-                label = f"🚦 Старт — {city}"
-            elif i == len(cities) - 1:
-                label = f"🏁 Финиш — {city}"
-            else:
-                label = f"📍 Промежуток — {city}"
-
-            cond  = data["weather"][0]
-            main  = data["main"]
-            wind  = data["wind"]
-            emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
-            warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Будьте осторожны." if cond["main"] in SEVERE_CONDITIONS else ""
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"{label}\n"
-                    f"{emoji} {cond['description'].capitalize()}\n"
-                    f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
-                    f"💧 Влажность: {main['humidity']}%\n"
-                    f"💨 Ветер: {wind['speed']:.1f} {speed}"
-                    f"{warn}"
-                )
-            )
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Не удалось получить погоду для {city}"
-            )
-            log.warning(f"parsetrip weather error for {city}: {e}")
+        label = "🚦 Старт" if i == 0 else "🏁 Финиш" if i == len(cities)-1 else "📍 Промежуток"
+        text  = format_weather_full(city, label)
+        await context.bot.send_message(chat_id=chat_id, text=text)
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "✅ Сводка по маршруту готова!\n\n"
-            "Хотите отслеживать погоду в пути?\n"
-            "Используйте /liveweather"
-        )
+        text="✅ Сводка по маршруту готова!\n\nДля отслеживания в пути: /liveweather"
     )
 
 
@@ -1240,30 +1238,11 @@ async def cb_autotrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду...")
 
     chat_id = saved["chat_id"]
-    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
-    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
 
     for i, city in enumerate(cities):
-        try:
-            data = _fetch_weather(city)
-            label = ("🚦 Старт" if i == 0 else "🏁 Финиш" if i == len(cities)-1 else "📍 Промежуток")
-            cond  = data["weather"][0]
-            main  = data["main"]
-            wind  = data["wind"]
-            emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
-            warn  = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"{label} — {city}\n"
-                    f"{emoji} {cond['description'].capitalize()}\n"
-                    f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}\n"
-                    f"💧 Влажность: {main['humidity']}%\n"
-                    f"💨 Ветер: {wind['speed']:.1f} {speed}{warn}"
-                )
-            )
-        except Exception as e:
-            log.warning(f"autotrip weather {city}: {e}")
+        label = "🚦 Старт" if i == 0 else "🏁 Финиш" if i == len(cities)-1 else "📍 Промежуток"
+        text  = format_weather_full(city, label)
+        await context.bot.send_message(chat_id=chat_id, text=text)
 
     await context.bot.send_message(
         chat_id=chat_id,
