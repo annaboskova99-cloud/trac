@@ -390,7 +390,7 @@ async def extract_cities_ai(text: str) -> list[str] | None:
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models"
-            f"/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            f"/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         )
         req = urllib.request.Request(
             url,
