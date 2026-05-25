@@ -304,13 +304,25 @@ def _geo_url(city):
 
 
 def geocode_city(city: str) -> dict | None:
-    """Возвращает {lat, lon, name} или None."""
+    """Возвращает {lat, lon, name} или None. Использует weather API напрямую."""
+    # Сначала пробуем Geocoding API
     try:
         data = _fetch_json(_geo_url(city))
         if data:
             return {"lat": data[0]["lat"], "lon": data[0]["lon"], "name": city}
+    except Exception:
+        pass
+    # Fallback: weather by city name → извлекаем координаты из ответа
+    try:
+        url = (f"https://api.openweathermap.org/data/2.5/weather"
+               f"?q={urllib.parse.quote(city)}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}")
+        data = _fetch_json(url)
+        lat = data["coord"]["lat"]
+        lon = data["coord"]["lon"]
+        name = data.get("name", city)
+        return {"lat": lat, "lon": lon, "name": name}
     except Exception as e:
-        log.warning(f"Геокодинг {city}: {e}")
+        log.warning(f"Геокодинг {city[:50]}: {e}")
     return None
 
 
