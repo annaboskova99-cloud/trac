@@ -38,6 +38,8 @@ WEATHER_API_KEY   = os.getenv("WEATHER_API_KEY", "")
 GOOGLE_MAPS_KEY   = os.getenv("GOOGLE_MAPS_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 WEATHER_UNITS     = "imperial"  # imperial=°F, metric=°C
+DISPATCH_GROUP_ID = int(os.getenv("DISPATCH_GROUP_ID", "0"))  # ID группы диспетчеров
+ARRIVED_TIMEOUT   = int(os.getenv("ARRIVED_TIMEOUT", "300"))  # секунд до эскалации (300 = 5 мин)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -284,71 +286,96 @@ SEVERE_CONDITIONS = {"Thunderstorm", "Tornado", "Squall", "Snow", "Blizzard"}
 
 
 def _fetch_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=8) as r:
+    with urllib.request.urlopen(url, timeout=10) as r:
         return _json.loads(r.read())
 
 
-def _weather_url(lat, lon):
-    return (f"https://api.openweathermap.org/data/2.5/weather"
-            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru")
-
-
-def _forecast_url(lat, lon):
-    return (f"https://api.openweathermap.org/data/2.5/forecast"
-            f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24")
-
-
-def _geo_url(city):
-    return (f"https://api.openweathermap.org/geo/1.0/direct"
-            f"?q={urllib.parse.quote(city)}&limit=1&appid={WEATHER_API_KEY}")
-
-
 def geocode_city(city: str) -> dict | None:
-    """Возвращает {lat, lon, name} или None. Использует weather API напрямую."""
-    # Сначала пробуем Geocoding API
-    try:
-        data = _fetch_json(_geo_url(city))
-        if data:
-            return {"lat": data[0]["lat"], "lon": data[0]["lon"], "name": city}
-    except Exception:
-        pass
-    # Fallback: weather by city name → извлекаем координаты из ответа
+    """
+    Геокодирует город через OpenWeatherMap weather API.
+    Возвращает {lat, lon, name} или None.
+    """
+    if not WEATHER_API_KEY:
+        log.warning("WEATHER_API_KEY не задан")
+        return None
+    # Убираем мусор из названия города
+    city = city.strip().strip("📦🟡📍🔰🛑").strip()
+    if len(city) < 2:
+        return None
     try:
         url = (f"https://api.openweathermap.org/data/2.5/weather"
                f"?q={urllib.parse.quote(city)}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}")
         data = _fetch_json(url)
-        lat = data["coord"]["lat"]
-        lon = data["coord"]["lon"]
-        name = data.get("name", city)
-        return {"lat": lat, "lon": lon, "name": name}
+        return {
+            "lat": data["coord"]["lat"],
+            "lon": data["coord"]["lon"],
+            "name": data.get("name", city),
+        }
+    except urllib.error.HTTPError as e:
+        log.warning(f"Геокодинг «{city[:40]}»: HTTP {e.code}")
     except Exception as e:
-        log.warning(f"Геокодинг {city[:50]}: {e}")
+        log.warning(f"Геокодинг «{city[:40]}»: {e}")
     return None
+
+
+def get_weather_data(lat: float, lon: float) -> dict | None:
+    """Получает текущую погоду по координатам."""
+    if not WEATHER_API_KEY:
+        return None
+    try:
+        url = (f"https://api.openweathermap.org/data/2.5/weather"
+               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru")
+        return _fetch_json(url)
+    except Exception as e:
+        log.warning(f"Погода ({lat},{lon}): {e}")
+        return None
+
+
+def get_forecast_data(lat: float, lon: float) -> dict | None:
+    """Получает прогноз на 3 дня по координатам."""
+    if not WEATHER_API_KEY:
+        return None
+    try:
+        url = (f"https://api.openweathermap.org/data/2.5/forecast"
+               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24")
+        return _fetch_json(url)
+    except Exception as e:
+        log.warning(f"Прогноз ({lat},{lon}): {e}")
+        return None
 
 
 def format_weather_city(lat: float, lon: float, label: str = "") -> str:
     """Текущая погода + прогноз 3 дня по координатам."""
     unit = "°F" if WEATHER_UNITS == "imperial" else "°C"
     speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
-    try:
-        w = _fetch_json(_weather_url(lat, lon))
-        main = w["main"]
-        wind = w["wind"]
-        cond = w["weather"][0]
-        emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
-        name = w.get("name", "?")
-        warn = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ!" if cond["main"] in SEVERE_CONDITIONS else ""
-        header = f"{label} — {name}" if label else name
-        lines = [
-            f"{emoji} {header}",
-            f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
-            f"💧 Влажность: {main['humidity']}%",
-            f"💨 Ветер: {wind['speed']:.1f} {speed}",
-            f"🌥 {cond['description'].capitalize()}{warn}",
-            "",
-            "📅 Прогноз на 3 дня:",
-        ]
-        fc = _fetch_json(_forecast_url(lat, lon))
+
+    if not WEATHER_API_KEY:
+        return "⚠️ WEATHER_API_KEY не настроен."
+
+    w = get_weather_data(lat, lon)
+    if not w:
+        return f"❌ Не удалось получить погоду для {label or 'города'}"
+
+    main = w["main"]
+    wind = w["wind"]
+    cond = w["weather"][0]
+    emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+    name = w.get("name", "?")
+    warn = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Соблюдайте осторожность." if cond["main"] in SEVERE_CONDITIONS else ""
+    header = f"{label} — {name}" if label else name
+
+    lines = [
+        f"{emoji} {header}",
+        f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
+        f"💧 Влажность: {main['humidity']}%",
+        f"💨 Ветер: {wind['speed']:.1f} {speed}",
+        f"🌥 {cond['description'].capitalize()}{warn}",
+        "",
+        "📅 Прогноз на 3 дня:",
+    ]
+
+    fc = get_forecast_data(lat, lon)
+    if fc:
         seen = set()
         for item in fc["list"]:
             dt = datetime.fromtimestamp(item["dt"])
@@ -363,43 +390,42 @@ def format_weather_city(lat: float, lon: float, label: str = "") -> str:
                 f"{em} {day}: {item['main']['temp_max']:.0f}/{item['main']['temp_min']:.0f}{unit}"
                 f" — {item['weather'][0]['description']}"
             )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"❌ Не удалось получить погоду: {e}"
+    else:
+        lines.append("(прогноз недоступен)")
+
+    return "\n".join(lines)
 
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Укажите город: /weather Chicago")
+        await update.message.reply_text(
+            "Укажите город: /weather Chicago\nИли: /weather New York"
+        )
         return
     city = " ".join(context.args)
     msg = await update.message.reply_text("⏳ Получаю погоду...")
     geo = geocode_city(city)
     if not geo:
-        await msg.edit_text(f"❌ Город «{city}» не найден.")
+        await msg.edit_text(
+            f"❌ Город «{city}» не найден. Попробуйте на английском: /weather New York"
+            "Попробуйте на английском: /weather New York"
+        )
         return
-    await msg.edit_text(format_weather_city(geo["lat"], geo["lon"]))
+    text = format_weather_city(geo["lat"], geo["lon"])
+    await msg.edit_text(text)
 
 
 # ══════════════════════════════════════════════════════════════
-# CLAUDE AI
+# CLAUDE AI — УМНЫЙ ПОМОЩНИК
 # ══════════════════════════════════════════════════════════════
-async def claude_advice(weather_summary: str, route_info: str) -> str:
-    """Советы от Claude только при опасных условиях."""
+async def ask_claude(prompt: str, max_tokens: int = 500) -> str:
+    """Базовый запрос к Claude API."""
     if not ANTHROPIC_API_KEY:
         return ""
     try:
-        prompt = (
-            f"You are a safety advisor for a truck driver.\n"
-            f"Route: {route_info}\n\n"
-            f"Weather data:\n{weather_summary}\n\n"
-            "Analyze ONLY dangerous weather conditions (thunderstorm, snow, tornado, blizzard, squall). "
-            "If no dangerous conditions — respond with exactly: 'OK'\n"
-            "If dangerous — give concise advice in Russian, max 5 bullet points, use emojis."
-        )
         payload = _json.dumps({
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 400,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
         req = urllib.request.Request(
@@ -412,13 +438,48 @@ async def claude_advice(weather_summary: str, route_info: str) -> str:
             },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             data = _json.loads(r.read())
-        result = data["content"][0]["text"].strip()
-        return "" if result == "OK" else result
+        return data["content"][0]["text"].strip()
     except Exception as e:
-        log.warning(f"Claude: {e}")
+        log.warning(f"Claude API: {e}")
         return ""
+
+
+async def claude_route_analysis(cities_weather: list[dict], origin: str, dest: str) -> str:
+    """Claude анализирует погоду по всему маршруту."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    lines = []
+    for item in cities_weather:
+        lines.append(
+            f"- {item['label']} ({item['city']}): "
+            f"{item['condition']}, {item['temp']:.0f}F, "
+            f"wind {item['wind']:.1f} mph, humidity {item['humidity']}%"
+        )
+    summary = "\n".join(lines)
+    prompt = (
+        f"You are a safety advisor for a truck driver from {origin} to {dest}.\n"
+        f"Weather:\n{summary}\n\n"
+        "Provide: 1) Safety rating (Safe/Caution/Dangerous) "
+        "2) Key risks 3) Driving advice. "
+        "Concise, emojis, in Russian, max 8 lines."
+    )
+    return await ask_claude(prompt, max_tokens=500)
+
+
+async def claude_location_advice(city: str, condition: str, temp: float, wind: float) -> str:
+    """Совет от Claude при обновлении геолокации."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    prompt = (
+        f"Truck driver near {city}. Weather: {condition}, {temp:.0f}F, wind {wind:.1f} mph. "
+        "Brief safety tip (2-3 lines, emojis, Russian). "
+        "If weather is fine respond exactly: OK"
+    )
+    result = await ask_claude(prompt, max_tokens=150)
+    return "" if result.strip() == "OK" else result
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -460,34 +521,38 @@ def get_route_cities(origin: str, dest: str) -> list[dict] | None:
 
 
 async def send_route_weather(bot, chat_id: int, cities: list[dict], origin: str, dest: str):
-    """Отправляет погоду по маршруту + совет Claude при опасных условиях."""
-    unit = "°F" if WEATHER_UNITS == "imperial" else "°C"
-    weather_summary_lines = []
+    """Отправляет погоду по всем городам маршрута + анализ от Claude."""
+    cities_weather_data = []  # для Claude
 
     for i, city in enumerate(cities):
         label = "🚦 Старт" if i == 0 else ("🏁 Финиш" if i == len(cities) - 1 else f"📍 Пункт {i}")
+        # Отправляем погоду + прогноз 3 дня
         text = format_weather_city(city["lat"], city["lon"], label)
         await bot.send_message(chat_id=chat_id, text=text)
-        # Для Claude собираем краткую сводку
-        try:
-            w = _fetch_json(_weather_url(city["lat"], city["lon"]))
-            weather_summary_lines.append(
-                f"- {label} {city['name']}: {w['weather'][0]['main']}, "
-                f"{w['main']['temp']:.0f}{unit}, wind {w['wind']['speed']:.1f} mph"
-            )
-        except Exception:
-            pass
+        # Собираем данные для Claude
+        w = get_weather_data(city["lat"], city["lon"])
+        if w:
+            cities_weather_data.append({
+                "label": label,
+                "city": w.get("name", city["name"]),
+                "condition": w["weather"][0]["main"],
+                "temp": w["main"]["temp"],
+                "wind": w["wind"]["speed"],
+                "humidity": w["main"]["humidity"],
+            })
 
-    # Claude — только при опасных условиях
-    if ANTHROPIC_API_KEY and weather_summary_lines:
-        summary = "\n".join(weather_summary_lines)
-        advice = await claude_advice(summary, f"{origin} → {dest}")
+    # Claude анализирует весь маршрут и даёт развёрнутый совет
+    if ANTHROPIC_API_KEY and cities_weather_data:
+        thinking_msg = await bot.send_message(chat_id=chat_id, text="🤖 Claude анализирует маршрут...")
+        advice = await claude_route_analysis(cities_weather_data, origin, dest)
         if advice:
-            await bot.send_message(chat_id=chat_id, text=f"🤖 Совет от Claude:\n\n{advice}")
+            await thinking_msg.edit_text(f"🤖 Анализ маршрута от Claude:\n\n{advice}")
+        else:
+            await thinking_msg.delete()
 
     await bot.send_message(
         chat_id=chat_id,
-        text="✅ Анализ маршрута завершён.\n\nДля отслеживания погоды в пути: /liveweather"
+        text="✅ Готово! Для отслеживания погоды в пути: /liveweather"
     )
 
 
@@ -548,10 +613,12 @@ async def handle_live_location(update: Update, context: ContextTypes.DEFAULT_TYP
             text = f"📍 Обновление погоды (+{dist:.0f} км)\n\n" + format_weather_city(lat, lon)
             await context.bot.send_message(chat_id=chat_id, text=text)
 
-            if severe and ANTHROPIC_API_KEY:
+            if ANTHROPIC_API_KEY and (severe or new_cond != prev.get("last_cond")):
                 city_name = w.get("name", "текущее местоположение")
-                summary = f"- {city_name}: {new_cond}, {w['main']['temp']:.0f}°F, wind {w['wind']['speed']:.1f} mph"
-                advice = await claude_advice(summary, f"водитель в районе {city_name}")
+                advice = await claude_location_advice(
+                    city_name, new_cond,
+                    w["main"]["temp"], w["wind"]["speed"]
+                )
                 if advice:
                     await context.bot.send_message(chat_id=chat_id, text=f"🤖 Совет от Claude:\n\n{advice}")
     except Exception as e:
@@ -1248,6 +1315,159 @@ def build_operator_conv():
 # ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# КОМАНДА /arrived — ПРИБЫТИЕ ВОДИТЕЛЯ
+# ══════════════════════════════════════════════════════════════
+# Хранилище ожидающих подтверждений:
+# { job_name: {"user_id", "chat_id", "driver_name", "msg_id", "confirmed"} }
+arrived_pending: dict[str, dict] = {}
+
+
+async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Водитель сообщает о прибытии. Запускается таймер ожидания ответа диспетчера."""
+    user_id  = update.effective_user.id
+    chat_id  = update.effective_chat.id
+    driver   = update.effective_user.full_name or f"Водитель {user_id}"
+
+    # Доп. информация из аргументов команды (опционально)
+    location_note = " ".join(context.args) if context.args else ""
+    location_text = f"\n📍 {location_note}" if location_note else ""
+
+    # Отправляем уведомление в группу
+    arrive_text = (
+        f"🏁 {driver} прибыл на место!{location_text}\n\n"
+        f"⏳ Ожидаю подтверждения от диспетчера...\n"
+        f"Диспетчер: нажмите кнопку ниже или ответьте на сообщение."
+    )
+    job_name = f"arrived_{user_id}_{chat_id}"
+    sent_msg = await update.message.reply_text(
+        arrive_text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Подтвердить прибытие", callback_data=f"confirm_arrived_{job_name}"),
+        ]])
+    )
+
+    # Сохраняем данные
+    arrived_pending[job_name] = {
+        "user_id":     user_id,
+        "chat_id":     chat_id,
+        "driver_name": driver,
+        "msg_id":      sent_msg.message_id,
+        "confirmed":   False,
+        "location":    location_note,
+    }
+
+    # Запускаем таймер эскалации
+    context.job_queue.run_once(
+        job_arrived_escalate,
+        when=ARRIVED_TIMEOUT,
+        data={"job_name": job_name},
+        name=job_name,
+    )
+
+    timeout_min = ARRIVED_TIMEOUT // 60
+    timeout_sec = ARRIVED_TIMEOUT % 60
+    time_label = f"{timeout_min} мин" if timeout_sec == 0 else f"{timeout_min} мин {timeout_sec} сек"
+    await update.message.reply_text(
+        f"⏱ Таймер запущен. Если диспетчер не ответит за {time_label} — "
+        f"группа диспетчеров будет уведомлена."
+    )
+    log.info(f"Arrived: {driver} ({user_id}) в чате {chat_id}, таймер {ARRIVED_TIMEOUT}с")
+
+
+async def job_arrived_escalate(context: ContextTypes.DEFAULT_TYPE):
+    """Джоб: если нет подтверждения — уведомляем группу диспетчеров."""
+    job_name = context.job.data["job_name"]
+    data = arrived_pending.get(job_name)
+
+    if not data or data["confirmed"]:
+        return  # уже подтверждено
+
+    driver   = data["driver_name"]
+    chat_id  = data["chat_id"]
+    location = data["location"]
+    location_text = f"\n📍 {location}" if location else ""
+
+    # Уведомляем в исходной группе
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⚠️ Внимание! {driver} прибыл, но диспетчер не ответил "
+            f"за {ARRIVED_TIMEOUT // 60} минут.{location_text}"
+        )
+    )
+
+    # Уведомляем группу диспетчеров
+    if DISPATCH_GROUP_ID:
+        await context.bot.send_message(
+            chat_id=DISPATCH_GROUP_ID,
+            text=(
+                f"🚨 ТРЕБУЕТСЯ ВНИМАНИЕ!\n\n"
+                f"Водитель {driver} прибыл на место, но не получил "
+                f"подтверждения от диспетчера в течение {ARRIVED_TIMEOUT // 60} минут.{location_text}\n\n"
+                f"Пожалуйста, свяжитесь с водителем или подтвердите прибытие.",
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"✅ Подтвердить ({driver})",
+                    callback_data=f"confirm_arrived_{job_name}"
+                )
+            ]])
+        )
+        log.info(f"Эскалация отправлена в группу диспетчеров {DISPATCH_GROUP_ID}")
+    else:
+        log.warning("DISPATCH_GROUP_ID не задан — эскалация не отправлена")
+
+
+async def cb_confirm_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диспетчер подтверждает прибытие."""
+    q = update.callback_query
+    await q.answer("✅ Прибытие подтверждено!")
+
+    job_name   = q.data.replace("confirm_arrived_", "")
+    data       = arrived_pending.get(job_name)
+    dispatcher = update.effective_user.full_name or "Диспетчер"
+
+    if not data:
+        await q.message.edit_reply_markup(reply_markup=None)
+        await q.message.reply_text("ℹ️ Это прибытие уже было подтверждено ранее.")
+        return
+
+    if data["confirmed"]:
+        await q.message.edit_reply_markup(reply_markup=None)
+        await q.message.reply_text("ℹ️ Уже подтверждено.")
+        return
+
+    # Отмечаем как подтверждённое
+    arrived_pending[job_name]["confirmed"] = True
+
+    # Отменяем таймер эскалации
+    for job in context.job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+
+    # Обновляем сообщение — убираем кнопку
+    await q.message.edit_reply_markup(reply_markup=None)
+
+    # Уведомляем в группе водителя
+    driver_name = data["driver_name"]
+    await context.bot.send_message(
+        chat_id=data["chat_id"],
+        text=(
+            f"✅ Прибытие {driver_name} подтверждено!\n"
+            f"👤 Подтвердил: {dispatcher}"
+        )
+    )
+
+    # Если подтверждение пришло из группы диспетчеров — дополнительно уведомляем
+    if update.effective_chat.id == DISPATCH_GROUP_ID:
+        await q.message.reply_text(
+            f"✅ {dispatcher} подтвердил прибытие {driver_name}."
+        )
+
+    log.info(f"Прибытие {driver_name} подтверждено диспетчером {dispatcher}")
+
+
+
 def main():
     init_db()
     log.info("БД инициализирована.")
@@ -1256,6 +1476,7 @@ def main():
 
     # ── Команды ───────────────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("arrived", cmd_arrived))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("weather", cmd_weather))
 
@@ -1275,6 +1496,7 @@ def main():
 
     # ── Inline callbacks ──────────────────────────────────────
     app.add_handler(CallbackQueryHandler(cb_autotrip, pattern=r"^autotrip_"))
+    app.add_handler(CallbackQueryHandler(cb_confirm_arrived, pattern=r"^confirm_arrived_"))
     app.add_handler(CallbackQueryHandler(cb_drv_edit,   pattern=r"^drv_edit_-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_drv_toggle, pattern=r"^drv_toggle_-?\d+$"))
     app.add_handler(CallbackQueryHandler(cb_drv_del,    pattern=r"^drv_del_-?\d+$"))
