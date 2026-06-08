@@ -37,7 +37,9 @@ TEST_MODE         = os.getenv("TEST_MODE", "false").lower() == "true"
 WEATHER_API_KEY   = os.getenv("WEATHER_API_KEY", "")
 GOOGLE_MAPS_KEY   = os.getenv("GOOGLE_MAPS_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-WEATHER_UNITS     = "imperial"  # imperial=°F, metric=°C
+WEATHER_UNITS        = "imperial"  # imperial=°F, metric=°C
+DISPATCHER_GROUP_ID  = int(os.getenv("DISPATCHER_GROUP_ID", "0"))  # ID группы диспетчеров
+ARRIVED_TIMEOUT_SEC  = int(os.getenv("ARRIVED_TIMEOUT_SEC", "300"))  # 5 минут
 DISPATCH_GROUP_ID = int(os.getenv("DISPATCH_GROUP_ID", "0"))  # ID группы диспетчеров
 ARRIVED_TIMEOUT   = int(os.getenv("ARRIVED_TIMEOUT", "300"))  # секунд до эскалации (300 = 5 мин)
 
@@ -397,27 +399,40 @@ def format_weather_city(lat: float, lon: float, label: str = "") -> str:
 
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Погода + прогноз 3 дня. Claude предупреждает при опасной погоде."""
     if not context.args:
         await update.message.reply_text(
-            "Укажите город: /weather Chicago\nИли: /weather New York"
+            "🌤 Укажите город:\n"
+            "/weather Chicago\n"
+            "/weather New York\n"
+            "/weather Los Angeles"
         )
         return
     city = " ".join(context.args)
-    msg = await update.message.reply_text("⏳ Получаю погоду...")
+    msg = await update.message.reply_text(f"⏳ Получаю погоду для {city}...")
     geo = geocode_city(city)
     if not geo:
         await msg.edit_text(
-            f"❌ Город «{city}» не найден. Попробуйте на английском: /weather New York"
+            f"❌ Город «{city}» не найден.\n"
             "Попробуйте на английском: /weather New York"
         )
         return
     text = format_weather_city(geo["lat"], geo["lon"])
+    # Claude добавляет совет если погода опасная
+    if ANTHROPIC_API_KEY:
+        w = get_weather_data(geo["lat"], geo["lon"])
+        if w and w["weather"][0]["main"] in SEVERE_CONDITIONS:
+            advice = await claude_location_advice(
+                geo["name"],
+                w["weather"][0]["main"],
+                w["main"]["temp"],
+                w["wind"]["speed"]
+            )
+            if advice:
+                text += f"\n\n🤖 Совет:\n{advice}"
     await msg.edit_text(text)
 
 
-# ══════════════════════════════════════════════════════════════
-# CLAUDE AI — УМНЫЙ ПОМОЩНИК
-# ══════════════════════════════════════════════════════════════
 async def ask_claude(prompt: str, max_tokens: int = 500) -> str:
     """Базовый запрос к Claude API."""
     if not ANTHROPIC_API_KEY:
@@ -900,10 +915,30 @@ def drivers_kb():
 # ── /start, /myid ────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if is_op(uid):
+    chat_type = update.effective_chat.type
+
+    if chat_type in ("group", "supergroup"):
+        # В группе — показываем список команд без кнопок
+        await update.message.reply_text(
+            "🚛 Trucking Bot\n\n"
+            "Команды для водителя:\n"
+            "/weather <город> — погода и прогноз на 3 дня\n"
+            "/arrived — уведомить о прибытии\n"
+            "/alarm — установить будильник\n"
+            "/awake — подтвердить пробуждение\n"
+            "/cancel — отменить текущее действие"
+        )
+    elif is_op(uid):
+        # Личный чат оператора — показываем панель
         await update.message.reply_text("👨‍💼 Панель оператора:", reply_markup=kb_op())
     else:
-        await update.message.reply_text("🚛 Trucking Bot активен.\nОжидайте уведомлений.")
+        await update.message.reply_text(
+            "🚛 Trucking Bot\n\n"
+            "Используйте команды в вашей группе:\n"
+            "/weather — погода\n"
+            "/arrived — прибытие\n"
+            "/alarm — будильник"
+        )
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1468,6 +1503,365 @@ async def cb_confirm_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
+# ══════════════════════════════════════════════════════════════
+# КОМАНДА /arrived — ПРИБЫТИЕ ВОДИТЕЛЯ
+# ══════════════════════════════════════════════════════════════
+# Хранилище ожидающих подтверждений:
+# { job_name: {"driver_name", "driver_chat_id", "group_chat_id", "message", "arrived_at"} }
+arrived_pending: dict[str, dict] = {}
+
+
+async def job_arrived_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Срабатывает если диспетчер не ответил за 5 минут."""
+    data = context.job.data
+    driver_name = data["driver_name"]
+    driver_chat_id = data["driver_chat_id"]
+    group_chat_id = data["group_chat_id"]
+    arrived_msg = data["message"]
+    arrived_at = data["arrived_at"]
+    job_name = context.job.name
+
+    # Убираем из pending
+    arrived_pending.pop(job_name, None)
+
+    log.warning(f"Таймаут прибытия: {driver_name} не получил ответа диспетчера")
+
+    # Уведомляем группу диспетчеров
+    if DISPATCHER_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=DISPATCHER_GROUP_ID,
+                text=(
+                    f"🚨 ВНИМАНИЕ! Нет ответа водителю!\n\n"
+                    f"👤 Водитель: {driver_name}\n"
+                    f"⏰ Прибыл: {arrived_at}\n"
+                    f"📍 Сообщение: {arrived_msg}\n\n"
+                    f"⏳ Прошло 5 минут — диспетчер не ответил!\n"
+                    f"Пожалуйста, свяжитесь с водителем."
+                )
+            )
+        except Exception as e:
+            log.warning(f"Не удалось уведомить группу диспетчеров: {e}")
+
+    # Уведомляем водителя
+    try:
+        await context.bot.send_message(
+            chat_id=group_chat_id,
+            text=(
+                "⏰ Диспетчер ещё не ответил.\n"
+                "Группа диспетчеров уже уведомлена — ожидайте связи."
+            )
+        )
+    except Exception as e:
+        log.warning(f"Не удалось уведомить водителя: {e}")
+
+
+async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Водитель сообщает о прибытии. Запускает таймер ожидания ответа диспетчера."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    arrived_at = datetime.now().strftime("%H:%M")
+
+    # Дополнительное сообщение от водителя (если написал после команды)
+    extra = " ".join(context.args) if context.args else ""
+    location_text = f" — {extra}" if extra else ""
+
+    msg_text = f"📍 Прибыл{location_text}"
+    arrived_at_full = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    # Отправляем уведомление в группу
+    await update.message.reply_text(
+        f"✅ Прибытие зафиксировано в {arrived_at}\n\n"
+        f"⏳ Ожидаю ответа диспетчера...\n"
+        f"Если нет ответа через 5 минут — группа диспетчеров будет уведомлена автоматически."
+    )
+
+    # Уведомляем диспетчерскую группу сразу
+    if DISPATCHER_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=DISPATCHER_GROUP_ID,
+                text=(
+                    f"📍 Водитель прибыл!\n\n"
+                    f"👤 {user.full_name}\n"
+                    f"⏰ Время: {arrived_at_full}\n"
+                    f"💬 {msg_text}\n\n"
+                    f"⚠️ Ответьте водителю в течение 5 минут."
+                )
+            )
+        except Exception as e:
+            log.warning(f"Уведомление диспетчеров: {e}")
+
+    # Запускаем таймер
+    job_name = f"arrived_{user.id}_{chat_id}"
+    # Отменяем предыдущий если был
+    for old_job in context.job_queue.get_jobs_by_name(job_name):
+        old_job.schedule_removal()
+
+    job_data = {
+        "driver_name": user.full_name,
+        "driver_chat_id": user.id,
+        "group_chat_id": chat_id,
+        "message": msg_text,
+        "arrived_at": arrived_at_full,
+    }
+    context.job_queue.run_once(
+        job_arrived_timeout,
+        when=ARRIVED_TIMEOUT_SEC,
+        data=job_data,
+        name=job_name,
+    )
+    arrived_pending[job_name] = job_data
+    log.info(f"Таймер прибытия запущен: {user.full_name}, job={job_name}")
+
+
+async def handle_dispatcher_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Отслеживает ответы в группах водителей.
+    Если оператор ответил — отменяем таймер.
+    """
+    msg = update.message
+    if not msg:
+        return
+
+    user_id = msg.from_user.id
+    chat_id = msg.chat_id
+
+    # Проверяем только операторов
+    if not is_op(user_id):
+        return
+
+    # Ищем активный таймер для этой группы
+    # job_name = arrived_{driver_user_id}_{chat_id}
+    jobs_to_cancel = []
+    for job_name, data in list(arrived_pending.items()):
+        if data["group_chat_id"] == chat_id:
+            jobs_to_cancel.append(job_name)
+
+    for job_name in jobs_to_cancel:
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        data = arrived_pending.pop(job_name, {})
+        driver_name = data.get("driver_name", "Водитель")
+        log.info(f"Таймер отменён: диспетчер ответил водителю {driver_name}")
+        await msg.reply_text(
+            f"✅ Ответ зафиксирован. Таймер для {driver_name} остановлен."
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+# БУДИЛЬНИК (/alarm)
+# ══════════════════════════════════════════════════════════════
+# Хранилище будильников: {job_name: {"driver_name", "chat_id", "wake_at"}}
+alarms_pending: dict[str, dict] = {}
+
+ALARM_CONV_SET = 700
+
+async def job_alarm_ring(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Будильник срабатывает — ждём ответа водителя 2 минуты."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    driver_name = data["driver_name"]
+    job_name = context.job.name
+    wake_at = data["wake_at"]
+
+    # Отправляем сигнал будильника
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏰ БУДИЛЬНИК! Время: {wake_at}\n\n"
+                f"{driver_name}, вы проснулись?\n"
+                f"Ответьте /awake в течение 2 минут."
+            )
+        )
+        alarms_pending[job_name] = {**data, "ring_msg_id": msg.message_id}
+    except Exception as e:
+        log.warning(f"Будильник {job_name}: {e}")
+        return
+
+    # Запускаем таймер ожидания ответа — 2 минуты
+    context.job_queue.run_once(
+        job_alarm_no_response,
+        when=120,
+        data={**data, "ring_job": job_name},
+        name=f"alarm_wait_{data['user_id']}",
+    )
+
+
+async def job_alarm_no_response(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Водитель не ответил на будильник — зовём диспетчера."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    driver_name = data["driver_name"]
+    ring_job = data.get("ring_job", "")
+    wake_at = data["wake_at"]
+
+    # Убираем из pending
+    alarms_pending.pop(ring_job, None)
+
+    log.warning(f"Водитель {driver_name} не ответил на будильник")
+
+    # Уведомляем группу диспетчеров
+    if DISPATCHER_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=DISPATCHER_GROUP_ID,
+                text=(
+                    f"🚨 ВОДИТЕЛЬ НЕ ОТВЕЧАЕТ НА БУДИЛЬНИК!\n\n"
+                    f"👤 Водитель: {driver_name}\n"
+                    f"⏰ Будильник был на: {wake_at}\n"
+                    f"⏳ 2 минуты прошло — нет ответа.\n\n"
+                    f"Пожалуйста, немедленно свяжитесь с водителем!"
+                )
+            )
+        except Exception as e:
+            log.warning(f"Уведомление диспетчеров (будильник): {e}")
+
+    # Уведомляем группу водителя
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🚨 Нет ответа на будильник!\n"
+                "Диспетчеры уже уведомлены и свяжутся с вами."
+            )
+        )
+    except Exception as e:
+        log.warning(f"Уведомление группы (будильник): {e}")
+
+
+async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Водитель устанавливает будильник."""
+    if context.args:
+        # Если время передано сразу: /alarm 14:30
+        time_str = context.args[0].strip()
+        return await _set_alarm(update, context, time_str)
+
+    await update.message.reply_text(
+        "⏰ Введите время будильника:\n\n"
+        "Формат: <code>14:30</code>\n"
+        "Или через сколько минут: <code>+90</code> (через 90 минут)",
+        parse_mode="HTML"
+    )
+    return ALARM_CONV_SET
+
+
+async def st_alarm_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает время и устанавливает будильник."""
+    time_str = update.message.text.strip()
+    return await _set_alarm(update, context, time_str)
+
+
+async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_str: str) -> int:
+    """Общая логика установки будильника."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    now = datetime.now()
+
+    # Разбираем время
+    try:
+        if time_str.startswith("+"):
+            # Через N минут
+            minutes = int(time_str[1:])
+            wake_time = now + __import__("datetime").timedelta(minutes=minutes)
+            wake_at = wake_time.strftime("%H:%M")
+            delay_sec = minutes * 60
+        else:
+            # Конкретное время HH:MM
+            hh, mm = map(int, time_str.split(":"))
+            from datetime import timedelta
+            wake_time = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if wake_time <= now:
+                wake_time += timedelta(days=1)  # если время уже прошло — на завтра
+            delay_sec = int((wake_time - now).total_seconds())
+            wake_at = wake_time.strftime("%H:%M")
+    except Exception:
+        await update.message.reply_text(
+            "❌ Неверный формат.\n\n"
+            "Примеры:\n"
+            "• <code>14:30</code> — в 14:30\n"
+            "• <code>+90</code> — через 90 минут",
+            parse_mode="HTML"
+        )
+        return ALARM_CONV_SET
+
+    # Отменяем старый будильник этого водителя в этом чате
+    old_job_name = f"alarm_{user.id}_{chat_id}"
+    for job in context.job_queue.get_jobs_by_name(old_job_name):
+        job.schedule_removal()
+
+    job_data = {
+        "driver_name": user.full_name,
+        "user_id": user.id,
+        "chat_id": chat_id,
+        "wake_at": wake_at,
+    }
+    context.job_queue.run_once(
+        job_alarm_ring,
+        when=delay_sec,
+        data=job_data,
+        name=old_job_name,
+    )
+
+    hours_left = delay_sec // 3600
+    mins_left = (delay_sec % 3600) // 60
+
+    if hours_left > 0:
+        time_label = f"{hours_left}ч {mins_left}мин"
+    else:
+        time_label = f"{mins_left}мин"
+
+    await update.message.reply_text(
+        f"⏰ Будильник установлен на {wake_at}\n"
+        f"До сигнала: {time_label}\n\n"
+        f"Когда сработает — ответьте /awake чтобы подтвердить."
+    )
+    log.info(f"Будильник: {user.full_name} → {wake_at} (через {delay_sec}с)")
+    return ConversationHandler.END
+
+
+async def cmd_awake(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Водитель подтверждает что проснулся."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # Отменяем таймер ожидания ответа
+    wait_job_name = f"alarm_wait_{user.id}"
+    cancelled = False
+    for job in context.job_queue.get_jobs_by_name(wait_job_name):
+        job.schedule_removal()
+        cancelled = True
+
+    # Убираем из pending
+    alarm_job_name = f"alarm_{user.id}_{chat_id}"
+    alarms_pending.pop(alarm_job_name, None)
+
+    if cancelled:
+        await update.message.reply_text(
+            f"✅ {user.full_name} проснулся! Хорошего пути! 🚛"
+        )
+        log.info(f"{user.full_name} ответил на будильник")
+    else:
+        await update.message.reply_text(
+            "✅ Принято! Хорошего пути! 🚛"
+        )
+
+
+def build_alarm_conv():
+    return ConversationHandler(
+        entry_points=[CommandHandler("alarm", cmd_alarm)],
+        states={
+            ALARM_CONV_SET: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_alarm_time)],
+        },
+        fallbacks=[CommandHandler("cancel", rw_cancel)],
+        per_user=True,
+        per_chat=False,
+        per_message=False,
+        allow_reentry=True,
+    )
+
+
 def main():
     init_db()
     log.info("БД инициализирована.")
@@ -1477,8 +1871,13 @@ def main():
     # ── Команды ───────────────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("arrived", cmd_arrived))
+    app.add_handler(CommandHandler("awake", cmd_awake))
+    app.add_handler(build_alarm_conv())
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("weather", cmd_weather))
+    app.add_handler(CommandHandler("arrived", cmd_arrived))
+    app.add_handler(CommandHandler("awake", cmd_awake))
+    app.add_handler(build_alarm_conv())
 
     # ── ConversationHandler-ы (приоритет над всеми текстовыми) ─
     app.add_handler(build_routeweather_conv())
@@ -1489,6 +1888,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"), sec_drivers))
     app.add_handler(MessageHandler(filters.Regex("^📋 Шаблоны$"), sec_templates))
     app.add_handler(MessageHandler(filters.Regex("^🕐 Расписания$"), sec_schedules))
+
+    # ── Ответ диспетчера — отменяет таймер ─────────────────────
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+        handle_dispatcher_reply,
+    ))
 
     # ── Геолокация ────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.LOCATION, handle_live_location))
