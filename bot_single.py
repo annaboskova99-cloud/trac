@@ -103,6 +103,13 @@ def init_db():
             sent_at TEXT DEFAULT (datetime('now')),
             source TEXT
         );
+        CREATE TABLE IF NOT EXISTS dispatcher_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         """)
         try:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(schedules)").fetchall()]
@@ -150,6 +157,41 @@ def toggle_driver(chat_id, active):
 def delete_driver(chat_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM drivers WHERE chat_id=?", (chat_id,))
+
+# ── CRUD группы диспетчеров ──────────────────────────────────
+def add_dispatcher_group(chat_id: int, title: str) -> bool:
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO dispatcher_groups (chat_id, title) VALUES (?,?)",
+                (chat_id, title)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            # Обновляем title если уже есть
+            conn.execute(
+                "UPDATE dispatcher_groups SET title=?, active=1 WHERE chat_id=?",
+                (title, chat_id)
+            )
+            return True
+
+def get_dispatcher_groups(active_only=True) -> list:
+    with get_conn() as conn:
+        q = "SELECT * FROM dispatcher_groups"
+        if active_only:
+            q += " WHERE active=1"
+        q += " ORDER BY title"
+        return conn.execute(q).fetchall()
+
+def delete_dispatcher_group(chat_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM dispatcher_groups WHERE chat_id=?", (chat_id,))
+
+def get_all_dispatcher_chat_ids() -> list[int]:
+    """Возвращает список chat_id всех активных групп диспетчеров."""
+    groups = get_dispatcher_groups(active_only=True)
+    return [g["chat_id"] for g in groups]
+
 
 # ── CRUD шаблоны ──────────────────────────────────────────────
 def get_templates():
@@ -286,6 +328,203 @@ WEATHER_EMOJI = {
 }
 SEVERE_CONDITIONS = {"Thunderstorm", "Tornado", "Squall", "Snow", "Blizzard"}
 
+# ── Пороги опасности для фур ─────────────────────────────────
+WIND_DANGER_MPH     = 40   # боковой ветер — риск опрокидывания
+WIND_CAUTION_MPH    = 25   # сильный ветер — снизить скорость
+VISIBILITY_DANGER   = 0.25 # мили — почти нулевая видимость
+VISIBILITY_CAUTION  = 1.0  # мили — плохая видимость
+FREEZE_TEMP_F       = 35   # °F — риск гололёда
+HEAVY_RAIN_MM       = 10   # мм/3ч — сильный ливень
+
+
+def analyze_truck_hazards(w: dict) -> list[str]:
+    """
+    Анализирует погодные данные и возвращает список предупреждений для фуры.
+    Возвращает список строк — каждая строка одно предупреждение.
+    """
+    alerts = []
+    main   = w.get("main", {})
+    wind   = w.get("wind", {})
+    cond   = w.get("weather", [{}])[0]
+    vis    = w.get("visibility", 10000)  # метры
+    rain   = w.get("rain", {}).get("3h", 0)
+    snow   = w.get("snow", {}).get("3h", 0)
+
+    temp_f    = main.get("temp", 50)
+    wind_spd  = wind.get("speed", 0)       # mph (imperial)
+    wind_gust = wind.get("gust", wind_spd) # mph
+    cond_main = cond.get("main", "")
+    vis_miles = vis / 1609.34              # метры → мили
+
+    # 1. Критичный ветер — риск опрокидывания фуры
+    if wind_gust >= WIND_DANGER_MPH:
+        alerts.append(
+            f"🚨 КРИТИЧНО: порывы ветра {wind_gust:.0f} mph — "
+            f"высокий риск опрокидывания фуры! Остановитесь."
+        )
+    elif wind_spd >= WIND_DANGER_MPH:
+        alerts.append(
+            f"🚨 ОПАСНО: боковой ветер {wind_spd:.0f} mph — "
+            f"держитесь дальше от отбойников, снизьте скорость."
+        )
+    elif wind_spd >= WIND_CAUTION_MPH or wind_gust >= WIND_CAUTION_MPH:
+        alerts.append(
+            f"⚠️ Сильный ветер {wind_spd:.0f} mph "
+            f"(порывы до {wind_gust:.0f} mph) — снизьте скорость."
+        )
+
+    # 2. Видимость
+    if vis_miles <= VISIBILITY_DANGER:
+        alerts.append(
+            f"🚨 КРИТИЧНО: видимость {vis_miles:.2f} мили — "
+            f"почти ноль. Включите аварийку, съедьте на обочину."
+        )
+    elif vis_miles <= VISIBILITY_CAUTION:
+        alerts.append(
+            f"⚠️ Плохая видимость: {vis_miles:.1f} мили — "
+            f"включите фары, увеличьте дистанцию."
+        )
+
+    # 3. Гололёд — температура около нуля + осадки
+    if temp_f <= FREEZE_TEMP_F and cond_main in ("Rain", "Drizzle", "Snow", "Sleet"):
+        alerts.append(
+            f"🧊 ГОЛОЛЁД: температура {temp_f:.0f}°F + осадки — "
+            f"дорога обледенела. Скорость не выше 35 mph."
+        )
+    elif temp_f <= FREEZE_TEMP_F and cond_main == "Clouds":
+        alerts.append(
+            f"🌡 Температура {temp_f:.0f}°F — возможен чёрный лёд "
+            f"на мостах и развязках."
+        )
+
+    # 4. Снег
+    if snow > 0:
+        if snow >= 5:
+            alerts.append(
+                f"❄️ СИЛЬНЫЙ снегопад: {snow:.1f} мм/3ч — "
+                f"видимость резко падает, цепи на колёса."
+            )
+        else:
+            alerts.append(
+                f"❄️ Снегопад: {snow:.1f} мм/3ч — "
+                f"снизьте скорость, увеличьте дистанцию."
+            )
+
+    # 5. Сильный дождь
+    if rain >= HEAVY_RAIN_MM:
+        alerts.append(
+            f"🌧️ Сильный ливень: {rain:.1f} мм/3ч — "
+            f"аквапланирование, скорость не выше 45 mph."
+        )
+    elif rain > 0 and cond_main == "Rain":
+        alerts.append(
+            f"🌧️ Дождь — увеличьте дистанцию до 4 секунд."
+        )
+
+    # 6. Гроза
+    if cond_main == "Thunderstorm":
+        alerts.append(
+            "⛈️ ГРОЗА — немедленно остановитесь в безопасном месте. "
+            "Не ехать во время грозы на высоком профиле."
+        )
+
+    # 7. Торнадо / шквал
+    if cond_main in ("Tornado", "Squall"):
+        alerts.append(
+            "🌪️ ТОРНАДО/ШКВАЛ — экстренная остановка! "
+            "Покиньте кабину, лягте в низину."
+        )
+
+    # 8. Туман
+    if cond_main in ("Fog", "Mist", "Haze") and vis_miles < 0.5:
+        alerts.append(
+            f"🌫️ Густой туман — включите противотуманки, "
+            f"скорость не выше 30 mph."
+        )
+
+    return alerts
+
+
+def format_truck_alerts(alerts: list[str]) -> str:
+    """Форматирует список алертов в текст."""
+    if not alerts:
+        return ""
+    return "\n".join(alerts)
+
+
+def format_weather_city(lat: float, lon: float, label: str = "") -> str:
+    """Текущая погода + прогноз 3 дня + алерты для фуры."""
+    unit  = "°F" if WEATHER_UNITS == "imperial" else "°C"
+    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
+
+    if not WEATHER_API_KEY:
+        return "⚠️ WEATHER_API_KEY не настроен."
+
+    w = get_weather_data(lat, lon)
+    if not w:
+        return f"❌ Не удалось получить погоду для {label or 'города'}"
+
+    main  = w["main"]
+    wind  = w["wind"]
+    cond  = w["weather"][0]
+    emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
+    name  = w.get("name", "?")
+    vis_m = w.get("visibility", 10000)
+    vis_miles = vis_m / 1609.34
+    gust  = wind.get("gust", 0)
+    header = f"{label} — {name}" if label else name
+
+    lines = [
+        f"{emoji} {header}",
+        f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
+        f"💧 Влажность: {main['humidity']}%",
+        f"💨 Ветер: {wind['speed']:.1f} {speed}" +
+            (f", порывы {gust:.0f} {speed}" if gust > wind["speed"] + 5 else ""),
+        f"👁 Видимость: {vis_miles:.1f} миль" if vis_miles < 5 else f"🌥 {cond['description'].capitalize()}",
+    ]
+
+    # Алерты для фуры
+    truck_alerts = analyze_truck_hazards(w)
+    if truck_alerts:
+        lines.append("")
+        lines.append("🚛 ПРЕДУПРЕЖДЕНИЯ ДЛЯ ВОДИТЕЛЯ:")
+        lines.extend(truck_alerts)
+
+    lines.append("")
+    lines.append("📅 Прогноз на 3 дня:")
+
+    fc = get_forecast_data(lat, lon)
+    if fc:
+        seen = set()
+        for item in fc["list"]:
+            dt  = datetime.fromtimestamp(item["dt"])
+            day = dt.strftime("%a %d.%m")
+            if day in seen:
+                continue
+            seen.add(day)
+            if len(seen) > 3:
+                break
+            em    = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
+            w_day = item.get("wind", {})
+            gust_day = w_day.get("gust", 0)
+            wind_day = w_day.get("speed", 0)
+            # Мини-алерт в прогнозе
+            day_alert = ""
+            if gust_day >= WIND_DANGER_MPH or wind_day >= WIND_DANGER_MPH:
+                day_alert = " ⚠️ветер"
+            if item["main"]["temp_min"] <= FREEZE_TEMP_F:
+                day_alert += " 🧊лёд"
+            if item["weather"][0]["main"] == "Thunderstorm":
+                day_alert += " ⛈"
+            lines.append(
+                f"{em} {day}: {item['main']['temp_max']:.0f}/{item['main']['temp_min']:.0f}{unit}"
+                f" — {item['weather'][0]['description']}{day_alert}"
+            )
+    else:
+        lines.append("(прогноз недоступен)")
+
+    return "\n".join(lines)
+
 
 def _fetch_json(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=10) as r:
@@ -344,58 +583,6 @@ def get_forecast_data(lat: float, lon: float) -> dict | None:
     except Exception as e:
         log.warning(f"Прогноз ({lat},{lon}): {e}")
         return None
-
-
-def format_weather_city(lat: float, lon: float, label: str = "") -> str:
-    """Текущая погода + прогноз 3 дня по координатам."""
-    unit = "°F" if WEATHER_UNITS == "imperial" else "°C"
-    speed = "mph" if WEATHER_UNITS == "imperial" else "м/с"
-
-    if not WEATHER_API_KEY:
-        return "⚠️ WEATHER_API_KEY не настроен."
-
-    w = get_weather_data(lat, lon)
-    if not w:
-        return f"❌ Не удалось получить погоду для {label or 'города'}"
-
-    main = w["main"]
-    wind = w["wind"]
-    cond = w["weather"][0]
-    emoji = WEATHER_EMOJI.get(cond["main"], "🌡️")
-    name = w.get("name", "?")
-    warn = "\n⚠️ ОПАСНЫЕ УСЛОВИЯ! Соблюдайте осторожность." if cond["main"] in SEVERE_CONDITIONS else ""
-    header = f"{label} — {name}" if label else name
-
-    lines = [
-        f"{emoji} {header}",
-        f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
-        f"💧 Влажность: {main['humidity']}%",
-        f"💨 Ветер: {wind['speed']:.1f} {speed}",
-        f"🌥 {cond['description'].capitalize()}{warn}",
-        "",
-        "📅 Прогноз на 3 дня:",
-    ]
-
-    fc = get_forecast_data(lat, lon)
-    if fc:
-        seen = set()
-        for item in fc["list"]:
-            dt = datetime.fromtimestamp(item["dt"])
-            day = dt.strftime("%a %d.%m")
-            if day in seen:
-                continue
-            seen.add(day)
-            if len(seen) > 3:
-                break
-            em = WEATHER_EMOJI.get(item["weather"][0]["main"], "🌡️")
-            lines.append(
-                f"{em} {day}: {item['main']['temp_max']:.0f}/{item['main']['temp_min']:.0f}{unit}"
-                f" — {item['weather'][0]['description']}"
-            )
-    else:
-        lines.append("(прогноз недоступен)")
-
-    return "\n".join(lines)
 
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,25 +649,34 @@ async def ask_claude(prompt: str, max_tokens: int = 500) -> str:
 
 
 async def claude_route_analysis(cities_weather: list[dict], origin: str, dest: str) -> str:
-    """Claude анализирует погоду по всему маршруту."""
+    """Claude анализирует погоду и truck hazards по всему маршруту."""
     if not ANTHROPIC_API_KEY:
         return ""
     lines = []
+    has_alerts = False
     for item in cities_weather:
+        alert_str = "; ".join(item.get("alerts", [])) or "no hazards"
+        if item.get("alerts"):
+            has_alerts = True
         lines.append(
             f"- {item['label']} ({item['city']}): "
             f"{item['condition']}, {item['temp']:.0f}F, "
-            f"wind {item['wind']:.1f} mph, humidity {item['humidity']}%"
+            f"wind {item['wind']:.1f} mph (gusts {item.get('wind_gust', 0):.0f}), "
+            f"visibility {item.get('visibility', 10):.1f} mi. "
+            f"Hazards: {alert_str}"
         )
     summary = "\n".join(lines)
     prompt = (
-        f"You are a safety advisor for a truck driver from {origin} to {dest}.\n"
-        f"Weather:\n{summary}\n\n"
-        "Provide: 1) Safety rating (Safe/Caution/Dangerous) "
-        "2) Key risks 3) Driving advice. "
-        "Concise, emojis, in Russian, max 8 lines."
+        f"You are a safety advisor for a long-haul truck driver from {origin} to {dest}.\n"
+        f"Weather and hazard data per city:\n{summary}\n\n"
+        "Based on this data provide in Russian:\n"
+        "1. Overall route safety: ✅ Safe / ⚠️ Caution / 🚨 Dangerous\n"
+        "2. Most dangerous section (if any)\n"
+        "3. Specific advice: speed limits, when to stop, what to watch for\n"
+        "4. Best time window to drive if weather is bad\n"
+        "Be concise, practical, use emojis. Max 10 lines."
     )
-    return await ask_claude(prompt, max_tokens=500)
+    return await ask_claude(prompt, max_tokens=600)
 
 
 async def claude_location_advice(city: str, condition: str, temp: float, wind: float) -> str:
@@ -541,19 +737,23 @@ async def send_route_weather(bot, chat_id: int, cities: list[dict], origin: str,
 
     for i, city in enumerate(cities):
         label = "🚦 Старт" if i == 0 else ("🏁 Финиш" if i == len(cities) - 1 else f"📍 Пункт {i}")
-        # Отправляем погоду + прогноз 3 дня
+        # Отправляем погоду + прогноз 3 дня + truck alerts
         text = format_weather_city(city["lat"], city["lon"], label)
         await bot.send_message(chat_id=chat_id, text=text)
         # Собираем данные для Claude
         w = get_weather_data(city["lat"], city["lon"])
         if w:
+            alerts = analyze_truck_hazards(w)
             cities_weather_data.append({
                 "label": label,
                 "city": w.get("name", city["name"]),
                 "condition": w["weather"][0]["main"],
                 "temp": w["main"]["temp"],
-                "wind": w["wind"]["speed"],
+                "wind": w["wind"].get("speed", 0),
+                "wind_gust": w["wind"].get("gust", 0),
                 "humidity": w["main"]["humidity"],
+                "visibility": w.get("visibility", 10000) / 1609.34,
+                "alerts": alerts,
             })
 
     # Claude анализирует весь маршрут и даёт развёрнутый совет
@@ -889,6 +1089,7 @@ def kb_op():
     return ReplyKeyboardMarkup([
         ["👥 Водители", "📋 Шаблоны"],
         ["🕐 Расписания", "📨 Рассылка"],
+        ["📢 Диспетчеры"],
     ], resize_keyboard=True)
 
 def kb_back(cb="back_main"):
@@ -909,7 +1110,8 @@ def drivers_kb():
     ST_TPL_TITLE, ST_TPL_TEXT,
     ST_SCH_TITLE, ST_SCH_TEXT, ST_SCH_CRON, ST_SCH_TARGET,
     ST_BC_TEXT, ST_BC_TARGET,
-) = range(10)
+    ST_DISP_CHAT, ST_DISP_TITLE,
+) = range(12)
 
 
 # ── /start, /myid ────────────────────────────────────────────
@@ -1255,6 +1457,22 @@ async def st_bc_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Уведомление групп диспетчеров ────────────────────────────
+async def notify_dispatchers(bot, text: str) -> int:
+    """Отправляет сообщение во все группы диспетчеров из БД."""
+    groups = get_all_dispatcher_chat_ids()
+    if not groups and DISPATCHER_GROUP_ID:
+        groups = [DISPATCHER_GROUP_ID]
+    sent = 0
+    for chat_id in groups:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except Exception as e:
+            log.warning(f"Уведомление диспетчеров ({chat_id}): {e}")
+    return sent
+
+
 # ── НАВИГАЦИЯ ─────────────────────────────────────────────────
 async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1271,6 +1489,11 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = [[InlineKeyboardButton(t["title"], callback_data=f"tpl_view_{t['id']}")] for t in tpls]
         rows.append([InlineKeyboardButton("➕ Новый", callback_data="tpl_add")])
         await q.message.reply_text("📋 Шаблоны:", reply_markup=InlineKeyboardMarkup(rows))
+    elif q.data == "nav_dispatchers":
+        groups = get_dispatcher_groups(active_only=False)
+        rows = [[InlineKeyboardButton(f"📢 {g['title']}", callback_data=f"disp_del_{g['chat_id']}")] for g in groups]
+        rows.append([InlineKeyboardButton("➕ Добавить", callback_data="disp_add")])
+        await q.message.reply_text("📢 Группы диспетчеров:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_schedules":
         scheds = get_schedules()
         rows = [[InlineKeyboardButton(("✅ " if s["active"] else "⏸ ") + s["title"], callback_data=f"sch_view_{s['id']}")] for s in scheds]
@@ -1322,10 +1545,11 @@ def build_operator_conv():
     """Операторские диалоги: водители, шаблоны, расписания, рассылка."""
     return ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(cb_drv_add, pattern="^drv_add$"),
-            CallbackQueryHandler(cb_tpl_add, pattern="^tpl_add$"),
-            CallbackQueryHandler(cb_tpl_send, pattern=r"^tpl_send_\d+$"),
-            CallbackQueryHandler(cb_sch_add, pattern="^sch_add$"),
+            CallbackQueryHandler(cb_drv_add,   pattern="^drv_add$"),
+            CallbackQueryHandler(cb_tpl_add,   pattern="^tpl_add$"),
+            CallbackQueryHandler(cb_tpl_send,  pattern=r"^tpl_send_\d+$"),
+            CallbackQueryHandler(cb_sch_add,   pattern="^sch_add$"),
+            CallbackQueryHandler(cb_disp_add,  pattern="^disp_add$"),
             MessageHandler(filters.Regex("^📨 Рассылка$"), sec_broadcast),
         ],
         states={
@@ -1339,6 +1563,8 @@ def build_operator_conv():
             ST_SCH_TARGET: [CallbackQueryHandler(st_sch_target, pattern=r"^target_")],
             ST_BC_TEXT:    [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, st_bc_text)],
             ST_BC_TARGET:  [CallbackQueryHandler(st_bc_target, pattern=r"^target_")],
+            ST_DISP_CHAT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_disp_chat)],
+            ST_DISP_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_disp_title)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         per_user=True,
@@ -1527,21 +1753,15 @@ async def job_arrived_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.warning(f"Таймаут прибытия: {driver_name} не получил ответа диспетчера")
 
     # Уведомляем группу диспетчеров
-    if DISPATCHER_GROUP_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=DISPATCHER_GROUP_ID,
-                text=(
-                    f"🚨 ВНИМАНИЕ! Нет ответа водителю!\n\n"
-                    f"👤 Водитель: {driver_name}\n"
-                    f"⏰ Прибыл: {arrived_at}\n"
-                    f"📍 Сообщение: {arrived_msg}\n\n"
-                    f"⏳ Прошло 5 минут — диспетчер не ответил!\n"
-                    f"Пожалуйста, свяжитесь с водителем."
-                )
-            )
-        except Exception as e:
-            log.warning(f"Не удалось уведомить группу диспетчеров: {e}")
+    await notify_dispatchers(
+        context.bot,
+        f"🚨 ВНИМАНИЕ! Нет ответа водителю!\n\n"
+        f"👤 Водитель: {driver_name}\n"
+        f"⏰ Прибыл: {arrived_at}\n"
+        f"📍 Сообщение: {arrived_msg}\n\n"
+        f"⏳ Прошло 5 минут — диспетчер не ответил!\n"
+        f"Пожалуйста, свяжитесь с водителем."
+    )
 
     # Уведомляем водителя
     try:
@@ -1577,20 +1797,14 @@ async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     # Уведомляем диспетчерскую группу сразу
-    if DISPATCHER_GROUP_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=DISPATCHER_GROUP_ID,
-                text=(
-                    f"📍 Водитель прибыл!\n\n"
-                    f"👤 {user.full_name}\n"
-                    f"⏰ Время: {arrived_at_full}\n"
-                    f"💬 {msg_text}\n\n"
-                    f"⚠️ Ответьте водителю в течение 5 минут."
-                )
-            )
-        except Exception as e:
-            log.warning(f"Уведомление диспетчеров: {e}")
+    await notify_dispatchers(
+        context.bot,
+        f"📍 Водитель прибыл!\n\n"
+        f"👤 {user.full_name}\n"
+        f"⏰ Время: {arrived_at_full}\n"
+        f"💬 {msg_text}\n\n"
+        f"⚠️ Ответьте водителю в течение 5 минут."
+    )
 
     # Запускаем таймер
     job_name = f"arrived_{user.id}_{chat_id}"
@@ -1703,20 +1917,14 @@ async def job_alarm_no_response(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.warning(f"Водитель {driver_name} не ответил на будильник")
 
     # Уведомляем группу диспетчеров
-    if DISPATCHER_GROUP_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=DISPATCHER_GROUP_ID,
-                text=(
-                    f"🚨 ВОДИТЕЛЬ НЕ ОТВЕЧАЕТ НА БУДИЛЬНИК!\n\n"
-                    f"👤 Водитель: {driver_name}\n"
-                    f"⏰ Будильник был на: {wake_at}\n"
-                    f"⏳ 2 минуты прошло — нет ответа.\n\n"
-                    f"Пожалуйста, немедленно свяжитесь с водителем!"
-                )
-            )
-        except Exception as e:
-            log.warning(f"Уведомление диспетчеров (будильник): {e}")
+    await notify_dispatchers(
+        context.bot,
+        f"🚨 ВОДИТЕЛЬ НЕ ОТВЕЧАЕТ НА БУДИЛЬНИК!\n\n"
+        f"👤 Водитель: {driver_name}\n"
+        f"⏰ Будильник был на: {wake_at}\n"
+        f"⏳ 2 минуты прошло — нет ответа.\n\n"
+        f"Пожалуйста, немедленно свяжитесь с водителем!"
+    )
 
     # Уведомляем группу водителя
     try:
@@ -1862,6 +2070,91 @@ def build_alarm_conv():
     )
 
 
+# ── ГРУППЫ ДИСПЕТЧЕРОВ ───────────────────────────────────────
+async def sec_dispatchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список групп диспетчеров."""
+    if not is_op(update.effective_user.id):
+        return
+    groups = get_dispatcher_groups(active_only=False)
+    rows = []
+    for g in groups:
+        rows.append([InlineKeyboardButton(
+            f"📢 {g['title']} ({g['chat_id']})",
+            callback_data=f"disp_del_{g['chat_id']}"
+        )])
+    rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="disp_add")])
+
+    text = "📢 Группы диспетчеров:\n\n"
+    if groups:
+        text += "\n".join(f"• {g['title']} ({g['chat_id']})" for g in groups)
+    else:
+        text += "Пока нет групп.\nДобавьте группу диспетчеров чтобы бот мог отправлять туда уведомления."
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_disp_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text(
+        "Введите chat_id группы диспетчеров.\n\n"
+        "Как узнать ID:\n"
+        "1. Добавьте @RawDataBot в группу диспетчеров\n"
+        "2. Скопируйте число из поля chat.id\n"
+        "3. Удалите @RawDataBot из группы\n\n"
+        "Также добавьте бота в группу диспетчеров!"
+    )
+    return ST_DISP_CHAT
+
+
+async def st_disp_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Введите числовой ID:")
+        return ST_DISP_CHAT
+    context.user_data["disp_chat_id"] = chat_id
+    await update.message.reply_text("Введите название группы (например: Диспетчеры Москва):")
+    return ST_DISP_TITLE
+
+
+async def st_disp_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = update.message.text.strip()
+    chat_id = context.user_data.pop("disp_chat_id", 0)
+    add_dispatcher_group(chat_id, title)
+    await update.message.reply_text(
+        f"✅ Группа диспетчеров добавлена!\n\n"
+        f"📢 {title}\n"
+        f"ID: {chat_id}\n\n"
+        "Теперь бот будет отправлять туда уведомления о прибытии и будильниках.",
+        reply_markup=kb_op()
+    )
+    return ConversationHandler.END
+
+
+async def cb_disp_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = int(q.data.split("_")[-1])
+    groups = get_dispatcher_groups(active_only=False)
+    g = next((x for x in groups if x["chat_id"] == chat_id), None)
+    if g:
+        await q.message.reply_text(
+            f"Удалить группу «{g['title']}»?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"disp_confirm_del_{chat_id}"),
+                InlineKeyboardButton("◀️ Отмена", callback_data="nav_dispatchers"),
+            ]])
+        )
+
+
+async def cb_disp_confirm_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = int(q.data.split("_")[-1])
+    delete_dispatcher_group(chat_id)
+    await q.message.reply_text("🗑 Группа удалена.", reply_markup=kb_op())
+
+
 def main():
     init_db()
     log.info("БД инициализирована.")
@@ -1886,6 +2179,7 @@ def main():
 
     # ── Кнопки меню оператора ─────────────────────────────────
     app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"), sec_drivers))
+    app.add_handler(MessageHandler(filters.Regex("^📢 Диспетчеры$"), sec_dispatchers))
     app.add_handler(MessageHandler(filters.Regex("^📋 Шаблоны$"), sec_templates))
     app.add_handler(MessageHandler(filters.Regex("^🕐 Расписания$"), sec_schedules))
 
@@ -1910,7 +2204,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_sch_view,   pattern=r"^sch_view_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_sch_toggle, pattern=r"^sch_toggle_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_sch_del,    pattern=r"^sch_del_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_nav, pattern=r"^(back_main|nav_drivers|nav_templates|nav_schedules)$"))
+    app.add_handler(CallbackQueryHandler(cb_disp_del,         pattern=r"^disp_del_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_disp_confirm_del, pattern=r"^disp_confirm_del_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_nav, pattern=r"^(back_main|nav_drivers|nav_templates|nav_schedules|nav_dispatchers)$"))
 
     # ── Автодетект Trip ID — ПОСЛЕДНИМ ────────────────────────
     app.add_handler(MessageHandler(
@@ -1921,6 +2217,29 @@ def main():
     async def on_start(app):
         register_all_schedules(app)
         log.info("Расписания загружены.")
+
+        # Устанавливаем команды для групп
+        from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+        group_commands = [
+            BotCommand("weather",  "🌤 Погода и прогноз на 3 дня"),
+            BotCommand("arrived",  "📍 Уведомить о прибытии"),
+            BotCommand("alarm",    "⏰ Установить будильник"),
+            BotCommand("awake",    "✅ Я проснулся"),
+            BotCommand("cancel",   "❌ Отменить действие"),
+        ]
+        private_commands = [
+            BotCommand("start",    "👨‍💼 Панель оператора"),
+            BotCommand("weather",  "🌤 Погода в городе"),
+            BotCommand("myid",     "🔑 Мой Telegram ID"),
+            BotCommand("cancel",   "❌ Отменить действие"),
+        ]
+        try:
+            await app.bot.set_my_commands(group_commands,   scope=BotCommandScopeAllGroupChats())
+            await app.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+            log.info("Команды бота установлены.")
+        except Exception as e:
+            log.warning(f"Не удалось установить команды: {e}")
+
     app.post_init = on_start
 
     log.info(f"Бот запущен. TEST_MODE={TEST_MODE}")
