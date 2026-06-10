@@ -1143,6 +1143,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ID текущего чата — для настройки группы диспетчеров."""
+    chat = update.effective_chat
+    user = update.effective_user
+    await update.message.reply_text(
+        f"📢 Информация о чате:\n\n"
+        f"ID чата: <code>{chat.id}</code>\n"
+        f"Название: {chat.title or chat.full_name or chr(8212)}\n"
+        f"Тип: {chat.type}\n\n"
+        "Скопируйте ID и добавьте его как группу диспетчеров\n"
+        "в панели оператора → 📢 Диспетчеры → ➕ Добавить группу",
+        parse_mode="HTML"
+    )
+
+
+
+
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
@@ -2167,6 +2184,7 @@ def main():
     app.add_handler(CommandHandler("awake", cmd_awake))
     app.add_handler(build_alarm_conv())
     app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("weather", cmd_weather))
     app.add_handler(CommandHandler("arrived", cmd_arrived))
     app.add_handler(CommandHandler("awake", cmd_awake))
