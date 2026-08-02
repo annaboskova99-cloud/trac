@@ -15,6 +15,7 @@ import urllib.request
 import json as _json
 from contextlib import contextmanager
 from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -32,12 +33,15 @@ from telegram.ext import (
 # ══════════════════════════════════════════════════════════════
 BOT_TOKEN         = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OPERATOR_IDS      = [int(x) for x in os.getenv("OPERATOR_IDS", "123456789").split(",")]
+# Группы где разрешена панель оператора (все участники могут управлять ботом)
+OPERATOR_CHAT_IDS = [int(x) for x in os.getenv("OPERATOR_CHAT_IDS", "-1003961422554").split(",") if x.strip()]
 DB_PATH           = os.getenv("DB_PATH", "/app/data/trucking.db")
 TEST_MODE         = os.getenv("TEST_MODE", "false").lower() == "true"
 WEATHER_API_KEY   = os.getenv("WEATHER_API_KEY", "")
 GOOGLE_MAPS_KEY   = os.getenv("GOOGLE_MAPS_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 WEATHER_UNITS        = "imperial"  # imperial=°F, metric=°C
+TRUCK_TIMEZONE       = os.getenv("TRUCK_TIMEZONE", "America/New_York")  # US timezone for alarms/notifications  # imperial=°F, metric=°C
 DISPATCHER_GROUP_ID  = int(os.getenv("DISPATCHER_GROUP_ID", "0"))  # ID группы диспетчеров
 ARRIVED_TIMEOUT_SEC  = int(os.getenv("ARRIVED_TIMEOUT_SEC", "300"))  # 5 минут
 DISPATCH_GROUP_ID = int(os.getenv("DISPATCH_GROUP_ID", "0"))  # ID группы диспетчеров
@@ -48,6 +52,27 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
+def now_local() -> datetime:
+    """Current time in truck timezone."""
+    try:
+        return datetime.now(ZoneInfo(TRUCK_TIMEZONE))
+    except Exception:
+        return datetime.now()
+
+def fmt_time(dt: datetime = None) -> str:
+    """Format time in truck timezone: HH:MM ET."""
+    if dt is None:
+        dt = now_local()
+    tz_abbr = dt.strftime("%Z") or "ET"
+    return dt.strftime(f"%I:%M %p {tz_abbr}")
+
+def fmt_datetime(dt: datetime = None) -> str:
+    """Format date+time in truck timezone."""
+    if dt is None:
+        dt = now_local()
+    tz_abbr = dt.strftime("%Z") or "ET"
+    return dt.strftime(f"%m/%d/%Y %I:%M %p {tz_abbr}")
 
 # ══════════════════════════════════════════════════════════════
 # БАЗА ДАННЫХ
@@ -287,7 +312,7 @@ async def job_send_scheduled(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=cid, text=s["text"])
             log_send(cid, s["text"] or "", "schedule")
         except Exception as e:
-            log.warning(f"Расписание #{sid} → {cid}: {e}")
+            log.warning(f"Schedule #{sid} → {cid}: {e}")
 
 
 def register_schedule(app, s):
@@ -300,7 +325,11 @@ def register_schedule(app, s):
                                     first=cron["seconds"], data=data, name=name)
     else:
         days = tuple(cron["days"]) if "days" in cron else tuple(range(7))
-        app.job_queue.run_daily(job_send_scheduled, time=cron["time"], days=days, data=data, name=name)
+        app.job_queue.run_daily(
+            job_send_scheduled,
+            time=cron["time"].replace(tzinfo=ZoneInfo(TRUCK_TIMEZONE)),
+            days=days, data=data, name=name
+        )
     log.info(f"Расписание: {name}")
 
 
@@ -314,7 +343,7 @@ def register_all_schedules(app):
         try:
             register_schedule(app, dict(s))
         except Exception as e:
-            log.warning(f"Расписание #{s['id']} пропущено: {e}")
+            log.warning(f"Schedule #{s['id']} пропущено: {e}")
             delete_schedule(s["id"])
 
 
@@ -359,7 +388,7 @@ def analyze_truck_hazards(w: dict) -> list[str]:
     # 1. Критичный ветер — риск опрокидывания фуры
     if wind_gust >= WIND_DANGER_MPH:
         alerts.append(
-            f"🚨 КРИТИЧНО: порывы ветра {wind_gust:.0f} mph — "
+            f"🚨 КРИТИЧНО: gusts ветра {wind_gust:.0f} mph — "
             f"высокий риск опрокидывания фуры! Остановитесь."
         )
     elif wind_spd >= WIND_DANGER_MPH:
@@ -370,7 +399,7 @@ def analyze_truck_hazards(w: dict) -> list[str]:
     elif wind_spd >= WIND_CAUTION_MPH or wind_gust >= WIND_CAUTION_MPH:
         alerts.append(
             f"⚠️ Сильный ветер {wind_spd:.0f} mph "
-            f"(порывы до {wind_gust:.0f} mph) — снизьте скорость."
+            f"(gusts до {wind_gust:.0f} mph) — снизьте скорость."
         )
 
     # 2. Видимость
@@ -418,7 +447,7 @@ def analyze_truck_hazards(w: dict) -> list[str]:
         )
     elif rain > 0 and cond_main == "Rain":
         alerts.append(
-            f"🌧️ Дождь — увеличьте дистанцию до 4 секунд."
+            f"🌧️ Rain — increase following distance to 4 seconds."
         )
 
     # 6. Гроза
@@ -462,7 +491,7 @@ def format_weather_city(lat: float, lon: float, label: str = "") -> str:
 
     w = get_weather_data(lat, lon)
     if not w:
-        return f"❌ Не удалось получить погоду для {label or 'города'}"
+        return f"❌ Could not get weather for {label or 'города'}"
 
     main  = w["main"]
     wind  = w["wind"]
@@ -476,28 +505,28 @@ def format_weather_city(lat: float, lon: float, label: str = "") -> str:
 
     lines = [
         f"{emoji} {header}",
-        f"🌡 {main['temp']:.0f}{unit}, ощущается {main['feels_like']:.0f}{unit}",
-        f"💧 Влажность: {main['humidity']}%",
-        f"💨 Ветер: {wind['speed']:.1f} {speed}" +
-            (f", порывы {gust:.0f} {speed}" if gust > wind["speed"] + 5 else ""),
-        f"👁 Видимость: {vis_miles:.1f} миль" if vis_miles < 5 else f"🌥 {cond['description'].capitalize()}",
+        f"🌡 {main['temp']:.0f}{unit}, feels like {main['feels_like']:.0f}{unit}",
+        f"💧 Humidity: {main['humidity']}%",
+        f"💨 Wind: {wind['speed']:.1f} {speed}" +
+            (f", gusts {gust:.0f} {speed}" if gust > wind["speed"] + 5 else ""),
+        f"👁 Visibility: {vis_miles:.1f} mi" if vis_miles < 5 else f"🌥 {cond['description'].capitalize()}",
     ]
 
     # Алерты для фуры
     truck_alerts = analyze_truck_hazards(w)
     if truck_alerts:
         lines.append("")
-        lines.append("🚛 ПРЕДУПРЕЖДЕНИЯ ДЛЯ ВОДИТЕЛЯ:")
+        lines.append("🚛 DRIVER WARNINGS:")
         lines.extend(truck_alerts)
 
     lines.append("")
-    lines.append("📅 Прогноз на 3 дня:")
+    lines.append("📅 3-Day Forecast:")
 
     fc = get_forecast_data(lat, lon)
     if fc:
         seen = set()
         for item in fc["list"]:
-            dt  = datetime.fromtimestamp(item["dt"])
+            dt  = datetime.fromtimestamp(item["dt"], tz=ZoneInfo(TRUCK_TIMEZONE))
             day = dt.strftime("%a %d.%m")
             if day in seen:
                 continue
@@ -521,7 +550,7 @@ def format_weather_city(lat: float, lon: float, label: str = "") -> str:
                 f" — {item['weather'][0]['description']}{day_alert}"
             )
     else:
-        lines.append("(прогноз недоступен)")
+        lines.append("(forecast unavailable)")
 
     return "\n".join(lines)
 
@@ -553,9 +582,9 @@ def geocode_city(city: str) -> dict | None:
             "name": data.get("name", city),
         }
     except urllib.error.HTTPError as e:
-        log.warning(f"Геокодинг «{city[:40]}»: HTTP {e.code}")
+        log.warning(f"Geocoding «{city[:40]}»: HTTP {e.code}")
     except Exception as e:
-        log.warning(f"Геокодинг «{city[:40]}»: {e}")
+        log.warning(f"Geocoding «{city[:40]}»: {e}")
     return None
 
 
@@ -568,7 +597,7 @@ def get_weather_data(lat: float, lon: float) -> dict | None:
                f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru")
         return _fetch_json(url)
     except Exception as e:
-        log.warning(f"Погода ({lat},{lon}): {e}")
+        log.warning(f"Weather ({lat},{lon}): {e}")
         return None
 
 
@@ -581,43 +610,166 @@ def get_forecast_data(lat: float, lon: float) -> dict | None:
                f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24")
         return _fetch_json(url)
     except Exception as e:
-        log.warning(f"Прогноз ({lat},{lon}): {e}")
+        log.warning(f"Forecast ({lat},{lon}): {e}")
         return None
 
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Погода + прогноз 3 дня. Claude предупреждает при опасной погоде."""
-    if not context.args:
-        await update.message.reply_text(
-            "🌤 Укажите город:\n"
-            "/weather Chicago\n"
-            "/weather New York\n"
-            "/weather Los Angeles"
+    """Unified weather command — /liveweather."""
+    await update.message.reply_text(
+        "🌤 Weather — choose mode:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📍 City weather", callback_data="wx_city")],
+            [InlineKeyboardButton("🗺 Route A → B",   callback_data="wx_route")],
+            [InlineKeyboardButton("📡 Live tracking", callback_data="wx_live")],
+        ])
+    )
+    return WX_CHOICE
+
+
+async def wx_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор режима погоды."""
+    q = update.callback_query
+    await q.answer()
+    await q.message.delete()
+
+    if q.data == "wx_city":
+        await q.message.chat.send_message(
+            "🌤 Введите название города:\n\n"
+            "Например: <code>Chicago</code> или <code>New York</code>",
+            parse_mode="HTML"
         )
-        return
-    city = " ".join(context.args)
-    msg = await update.message.reply_text(f"⏳ Получаю погоду для {city}...")
-    geo = geocode_city(city)
+        return WX_CITY
+
+    elif q.data == "wx_route":
+        await q.message.chat.send_message(
+            "🗺 Введите точку отправления:\n\n"
+            "Например: <code>San Bernardino, CA</code>",
+            parse_mode="HTML"
+        )
+        return WX_ORIGIN
+
+    elif q.data == "wx_live":
+        await q.message.chat.send_message(
+            "📡 Укажите маршрут через /:\n\n"
+            "<code>New York / Cleveland / Chicago</code>\n\n"
+            "Затем включите: 📎 Скрепка → Location → Share Live Location",
+            parse_mode="HTML"
+        )
+        return WX_ROUTE
+
+    return ConversationHandler.END
+
+
+async def wx_get_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Погода в одном городе."""
+    city = update.message.text.strip()
+    msg  = await update.message.reply_text(f"⏳ Getting weather for {city}...")
+    geo  = geocode_city(city)
     if not geo:
         await msg.edit_text(
             f"❌ Город «{city}» не найден.\n"
-            "Попробуйте на английском: /weather New York"
+            "Попробуйте на английском: Chicago, New York"
         )
-        return
+        return ConversationHandler.END
     text = format_weather_city(geo["lat"], geo["lon"])
-    # Claude добавляет совет если погода опасная
     if ANTHROPIC_API_KEY:
         w = get_weather_data(geo["lat"], geo["lon"])
         if w and w["weather"][0]["main"] in SEVERE_CONDITIONS:
             advice = await claude_location_advice(
-                geo["name"],
-                w["weather"][0]["main"],
-                w["main"]["temp"],
-                w["wind"]["speed"]
+                geo["name"], w["weather"][0]["main"],
+                w["main"]["temp"], w["wind"]["speed"]
             )
             if advice:
                 text += f"\n\n🤖 Совет:\n{advice}"
     await msg.edit_text(text)
+    return ConversationHandler.END
+
+
+async def wx_get_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает точку А маршрута."""
+    context.user_data["wx_origin"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ Старт: {context.user_data['wx_origin']}\n\n"
+        "Теперь введите пункт назначения:\n"
+        "Например: <code>Teterboro, NJ</code>",
+        parse_mode="HTML"
+    )
+    return WX_DEST
+
+
+async def wx_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает точку Б и строит маршрут."""
+    origin  = context.user_data.pop("wx_origin", "")
+    dest    = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    msg     = await update.message.reply_text(f"🔍 Building route {origin} → {dest}...")
+
+    cities = get_route_cities(origin, dest)
+    if not cities:
+        city_dicts = []
+        for c in [origin, dest]:
+            geo = geocode_city(c)
+            if geo:
+                city_dicts.append(geo)
+        if len(city_dicts) >= 2:
+            await msg.edit_text(f"🗺 {origin} → {dest}\n\nGetting weather...")
+            await send_route_weather(context.bot, chat_id, city_dicts, origin, dest)
+        else:
+            await msg.edit_text("❌ Cities not found. Check the names.")
+    else:
+        await msg.edit_text(f"🗺 {origin} → {dest}\nТочек: {len(cities)}\nGetting weather...")
+        await send_route_weather(context.bot, chat_id, cities, origin, dest)
+    return ConversationHandler.END
+
+
+async def wx_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает маршрут для живого отслеживания."""
+    chat_id   = update.effective_chat.id
+    cities_raw = [c.strip() for c in update.message.text.split("/") if c.strip()]
+    if len(cities_raw) < 2:
+        await update.message.reply_text(
+            "Нужно минимум 2 города.\nПример: <code>New York / Chicago</code>",
+            parse_mode="HTML"
+        )
+        return WX_ROUTE
+    await update.message.reply_text(f"📋 Маршрут: {' → '.join(cities_raw)}\nGetting weather...")
+    city_dicts = [geo for c in cities_raw if (geo := geocode_city(c))]
+    if len(city_dicts) >= 2:
+        await send_route_weather(context.bot, chat_id, city_dicts, cities_raw[0], cities_raw[-1])
+    else:
+        await update.message.reply_text("❌ Could not find cities.")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="📎 Включите живую геолокацию:\nСкрепка → Location → Share Live Location"
+    )
+    return ConversationHandler.END
+
+
+async def wx_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+def build_weather_conv():
+    """Единый ConversationHandler для всех режимов погоды."""
+    return ConversationHandler(
+        entry_points=[CommandHandler("liveweather", cmd_weather), CommandHandler("weather", cmd_weather)],
+        states={
+            WX_CHOICE: [CallbackQueryHandler(wx_choice, pattern=r"^wx_")],
+            WX_CITY:   [MessageHandler(filters.TEXT & ~filters.COMMAND, wx_get_city)],
+            WX_ORIGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wx_get_origin)],
+            WX_DEST:   [MessageHandler(filters.TEXT & ~filters.COMMAND, wx_get_dest)],
+            WX_ROUTE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, wx_get_route)],
+        },
+        fallbacks=[CommandHandler("cancel", wx_cancel)],
+        per_user=True,
+        per_chat=False,
+        per_message=False,
+        allow_reentry=True,
+    )
+
 
 
 async def ask_claude(prompt: str, max_tokens: int = 500) -> str:
@@ -649,7 +801,7 @@ async def ask_claude(prompt: str, max_tokens: int = 500) -> str:
 
 
 async def claude_route_analysis(cities_weather: list[dict], origin: str, dest: str) -> str:
-    """Claude анализирует погоду и truck hazards по всему маршруту."""
+    """Claude analyzing погоду и truck hazards по всему маршруту."""
     if not ANTHROPIC_API_KEY:
         return ""
     lines = []
@@ -736,7 +888,7 @@ async def send_route_weather(bot, chat_id: int, cities: list[dict], origin: str,
     cities_weather_data = []  # для Claude
 
     for i, city in enumerate(cities):
-        label = "🚦 Старт" if i == 0 else ("🏁 Финиш" if i == len(cities) - 1 else f"📍 Пункт {i}")
+        label = "🚦 Start" if i == 0 else ("🏁 Finish" if i == len(cities) - 1 else f"📍 Stop {i}")
         # Отправляем погоду + прогноз 3 дня + truck alerts
         text = format_weather_city(city["lat"], city["lon"], label)
         await bot.send_message(chat_id=chat_id, text=text)
@@ -756,9 +908,9 @@ async def send_route_weather(bot, chat_id: int, cities: list[dict], origin: str,
                 "alerts": alerts,
             })
 
-    # Claude анализирует весь маршрут и даёт развёрнутый совет
+    # Claude analyzing весь маршрут и даёт развёрнутый совет
     if ANTHROPIC_API_KEY and cities_weather_data:
-        thinking_msg = await bot.send_message(chat_id=chat_id, text="🤖 Claude анализирует маршрут...")
+        thinking_msg = await bot.send_message(chat_id=chat_id, text="🤖 Claude analyzing route...")
         advice = await claude_route_analysis(cities_weather_data, origin, dest)
         if advice:
             await thinking_msg.edit_text(f"🤖 Анализ маршрута от Claude:\n\n{advice}")
@@ -767,7 +919,7 @@ async def send_route_weather(bot, chat_id: int, cities: list[dict], origin: str,
 
     await bot.send_message(
         chat_id=chat_id,
-        text="✅ Готово! Для отслеживания погоды в пути: /liveweather"
+        text="✅ Done! Use /liveweather to track weather en route."
     )
 
 
@@ -796,7 +948,7 @@ async def handle_live_location(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if getattr(msg.location, "live_period", None) is None and user_id in live_locations:
         del live_locations[user_id]
-        await context.bot.send_message(chat_id=chat_id, text="📍 Отслеживание завершено.")
+        await context.bot.send_message(chat_id=chat_id, text="📍 Tracking stopped.")
         return
 
     prev = live_locations.get(user_id)
@@ -917,7 +1069,7 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not any(kw.lower() in clean.lower() for kw in TRIP_KEYWORDS):
         return
 
-    log.info(f"auto_detect_trip: Trip ID detected в чате {msg.chat_id}")
+    log.info(f"auto_detect_trip: Trip ID detected in chat {msg.chat_id}")
 
     context.bot_data[f"trip_{msg.message_id}"] = {
         "text": clean,
@@ -927,7 +1079,7 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚛 Вижу сообщение с маршрутом!\nОтправить погоду по всем точкам?",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Да", callback_data=f"autotrip_{msg.message_id}"),
-            InlineKeyboardButton("❌ Нет", callback_data="autotrip_cancel"),
+            InlineKeyboardButton("❌ No", callback_data="autotrip_cancel"),
         ]])
     )
 
@@ -943,15 +1095,15 @@ async def cb_autotrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_id = q.data.replace("autotrip_", "")
     saved = context.bot_data.get(f"trip_{msg_id}")
     if not saved:
-        await q.message.edit_text("❌ Данные устарели. Попробуйте снова.")
+        await q.message.edit_text("❌ Data expired. Please try again.")
         return
 
     cities = extract_cities_from_trip(saved["text"])
     if not cities:
-        await q.message.edit_text("❌ Не удалось найти города в сообщении.")
+        await q.message.edit_text("❌ Could not find cities in the message.")
         return
 
-    await q.message.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nПолучаю погоду...")
+    await q.message.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nGetting weather...")
     chat_id = saved["chat_id"]
 
     city_dicts = []
@@ -1000,14 +1152,14 @@ async def rw_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dest = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    msg = await update.message.reply_text(f"🔍 Строю маршрут {origin} → {dest}...")
+    msg = await update.message.reply_text(f"🔍 Building route {origin} → {dest}...")
 
     # Пробуем Google Maps
     cities = get_route_cities(origin, dest)
 
     if not cities:
         # Без Google Maps — геокодируем только старт и финиш
-        await msg.edit_text(f"📋 {origin} → {dest}\n\nПолучаю погоду...")
+        await msg.edit_text(f"📋 {origin} → {dest}\n\nGetting weather...")
         city_dicts = []
         for c in [origin, dest]:
             geo = geocode_city(c)
@@ -1016,9 +1168,9 @@ async def rw_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(city_dicts) >= 2:
             await send_route_weather(context.bot, chat_id, city_dicts, origin, dest)
         else:
-            await context.bot.send_message(chat_id=chat_id, text="❌ Города не найдены. Проверьте названия.")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Cities not found. Check the names.")
     else:
-        await msg.edit_text(f"🗺 {origin} → {dest}\nТочек: {len(cities)}\nПолучаю погоду...")
+        await msg.edit_text(f"🗺 {origin} → {dest}\nТочек: {len(cities)}\nGetting weather...")
         await send_route_weather(context.bot, chat_id, cities, origin, dest)
 
     return ConversationHandler.END
@@ -1026,7 +1178,7 @@ async def rw_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rw_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Отменено.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
@@ -1055,7 +1207,7 @@ async def lw_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нужно минимум 2 города.\nПример: <code>New York / Chicago</code>", parse_mode="HTML")
         return LW_ROUTE
 
-    await update.message.reply_text(f"📋 Маршрут: {' → '.join(cities_raw)}\nПолучаю погоду...")
+    await update.message.reply_text(f"📋 Маршрут: {' → '.join(cities_raw)}\nGetting weather...")
 
     city_dicts = []
     for c in cities_raw:
@@ -1066,7 +1218,7 @@ async def lw_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(city_dicts) >= 2:
         await send_route_weather(context.bot, chat_id, city_dicts, cities_raw[0], cities_raw[-1])
     else:
-        await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось найти города.")
+        await context.bot.send_message(chat_id=chat_id, text="❌ Could not find cities.")
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1076,14 +1228,27 @@ async def lw_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lw_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════
 # КЛАВИАТУРЫ И УТИЛИТЫ
 # ══════════════════════════════════════════════════════════════
-def is_op(uid): return uid in OPERATOR_IDS
+def is_op(uid, chat_id=None) -> bool:
+    """Проверяет права оператора — по user_id или по группе."""
+    if uid in OPERATOR_IDS:
+        return True
+    if chat_id and chat_id in OPERATOR_CHAT_IDS:
+        return True
+    return False
+
+
+def is_op_update(update) -> bool:
+    """Проверяет права оператора из объекта Update."""
+    uid = update.effective_user.id if update.effective_user else 0
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    return is_op(uid, chat_id)
 
 def kb_op():
     return ReplyKeyboardMarkup([
@@ -1111,16 +1276,22 @@ def drivers_kb():
     ST_SCH_TITLE, ST_SCH_TEXT, ST_SCH_CRON, ST_SCH_TARGET,
     ST_BC_TEXT, ST_BC_TARGET,
     ST_DISP_CHAT, ST_DISP_TITLE,
-) = range(12)
+    # Единая команда погоды
+    WX_CHOICE, WX_CITY, WX_ORIGIN, WX_DEST, WX_ROUTE,
+) = range(17)
 
 
 # ── /start, /myid ────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid     = update.effective_user.id
+    chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
 
-    if chat_type in ("group", "supergroup"):
-        # В группе — показываем список команд без кнопок
+    if is_op(uid, chat_id):
+        # Оператор (лично или из группы диспетчеров) — показываем панель
+        await update.message.reply_text("👨‍💼 Панель оператора:", reply_markup=kb_op())
+    elif chat_type in ("group", "supergroup"):
+        # Группа водителя — только команды водителя
         await update.message.reply_text(
             "🚛 Trucking Bot\n\n"
             "Команды для водителя:\n"
@@ -1130,9 +1301,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/awake — подтвердить пробуждение\n"
             "/cancel — отменить текущее действие"
         )
-    elif is_op(uid):
-        # Личный чат оператора — показываем панель
-        await update.message.reply_text("👨‍💼 Панель оператора:", reply_markup=kb_op())
     else:
         await update.message.reply_text(
             "🚛 Trucking Bot\n\n"
@@ -1148,12 +1316,12 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     await update.message.reply_text(
-        f"📢 Информация о чате:\n\n"
-        f"ID чата: <code>{chat.id}</code>\n"
-        f"Название: {chat.title or chat.full_name or chr(8212)}\n"
-        f"Тип: {chat.type}\n\n"
-        "Скопируйте ID и добавьте его как группу диспетчеров\n"
-        "в панели оператора → 📢 Диспетчеры → ➕ Добавить группу",
+        f"📢 Chat info:\n\n"
+        f"Chat ID: <code>{chat.id}</code>\n"
+        f"Title: {chat.title or chat.full_name or chr(8212)}\n"
+        f"Type: {chat.type}\n\n"
+        "Copy the ID and add it as a dispatcher group\n"
+        "in operator panel → 📢 Dispatchers → ➕ Add group",
         parse_mode="HTML"
     )
 
@@ -1164,7 +1332,7 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
         f"👤 Ваш ID: <code>{uid}</code>\n"
-        f"Оператор: {'✅' if is_op(uid) else '❌'}\n"
+        f"Operator: {'✅' if is_op(uid) else '❌'}\n"
         f"OPERATOR_IDS: <code>{OPERATOR_IDS}</code>",
         parse_mode="HTML"
     )
@@ -1172,7 +1340,7 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ВОДИТЕЛИ ─────────────────────────────────────────────────
 async def sec_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_op(update.effective_user.id): return
+    if not is_op_update(update): return
     drivers = get_all_drivers(active_only=False)
     rows = [[InlineKeyboardButton(
         ("✅ " if d["active"] else "❌ ") + d["name"],
@@ -1253,7 +1421,7 @@ async def cb_drv_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ШАБЛОНЫ ──────────────────────────────────────────────────
 async def sec_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_op(update.effective_user.id): return
+    if not is_op_update(update): return
     tpls = get_templates()
     rows = [[InlineKeyboardButton(t["title"], callback_data=f"tpl_view_{t['id']}")] for t in tpls]
     rows.append([InlineKeyboardButton("➕ Новый шаблон", callback_data="tpl_add")])
@@ -1318,7 +1486,7 @@ async def cb_tpl_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── РАСПИСАНИЯ ────────────────────────────────────────────────
 async def sec_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_op(update.effective_user.id): return
+    if not is_op_update(update): return
     scheds = get_schedules()
     rows = [[InlineKeyboardButton(
         ("✅ " if s["active"] else "⏸ ") + f"{s['title']} ({s['cron_expr']})",
@@ -1431,7 +1599,7 @@ async def cb_sch_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── РАССЫЛКА ─────────────────────────────────────────────────
 async def sec_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_op(update.effective_user.id): return ConversationHandler.END
+    if not is_op_update(update): return ConversationHandler.END
     await update.message.reply_text("📨 Введите текст (или отправьте фото/файл с подписью):")
     return ST_BC_TEXT
 
@@ -1469,7 +1637,7 @@ async def st_bc_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_send(cid, text)
             sent += 1
         except Exception as e:
-            log.warning(f"Рассылка → {cid}: {e}")
+            log.warning(f"Broadcast → {cid}: {e}")
     await q.message.reply_text(f"✅ Отправлено: {sent}/{len(chat_ids)}", reply_markup=kb_op())
     return ConversationHandler.END
 
@@ -1486,7 +1654,7 @@ async def notify_dispatchers(bot, text: str) -> int:
             await bot.send_message(chat_id=chat_id, text=text)
             sent += 1
         except Exception as e:
-            log.warning(f"Уведомление диспетчеров ({chat_id}): {e}")
+            log.warning(f"Dispatcher notification ({chat_id}): {e}")
     return sent
 
 
@@ -1520,7 +1688,7 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Отменено.", reply_markup=kb_op())
+    await update.message.reply_text("Cancelled.", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1767,17 +1935,17 @@ async def job_arrived_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Убираем из pending
     arrived_pending.pop(job_name, None)
 
-    log.warning(f"Таймаут прибытия: {driver_name} не получил ответа диспетчера")
+    log.warning(f"Arrival timeout: {driver_name} received no dispatcher response")
 
     # Уведомляем группу диспетчеров
     await notify_dispatchers(
         context.bot,
-        f"🚨 ВНИМАНИЕ! Нет ответа водителю!\n\n"
-        f"👤 Водитель: {driver_name}\n"
-        f"⏰ Прибыл: {arrived_at}\n"
-        f"📍 Сообщение: {arrived_msg}\n\n"
-        f"⏳ Прошло 5 минут — диспетчер не ответил!\n"
-        f"Пожалуйста, свяжитесь с водителем."
+        f"🚨 ALERT! No response to driver!\n\n"
+        f"👤 Driver: {driver_name}\n"
+        f"⏰ Arrived: {arrived_at}\n"
+        f"📍 Message: {arrived_msg}\n\n"
+        f"⏳ 5 minutes passed — dispatcher did not respond!\n"
+        f"Please contact the driver."
     )
 
     # Уведомляем водителя
@@ -1785,8 +1953,8 @@ async def job_arrived_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=group_chat_id,
             text=(
-                "⏰ Диспетчер ещё не ответил.\n"
-                "Группа диспетчеров уже уведомлена — ожидайте связи."
+                "⏰ Dispatcher has not responded yet.\n"
+                "Dispatcher group has been notified — please wait for contact."
             )
         )
     except Exception as e:
@@ -1797,30 +1965,30 @@ async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Водитель сообщает о прибытии. Запускает таймер ожидания ответа диспетчера."""
     user = update.effective_user
     chat_id = update.effective_chat.id
-    arrived_at = datetime.now().strftime("%H:%M")
+    arrived_at = fmt_time()
 
     # Дополнительное сообщение от водителя (если написал после команды)
     extra = " ".join(context.args) if context.args else ""
     location_text = f" — {extra}" if extra else ""
 
-    msg_text = f"📍 Прибыл{location_text}"
-    arrived_at_full = datetime.now().strftime("%d.%m.%Y %H:%M")
+    msg_text = f"📍 Arrived{location_text}"
+    arrived_at_full = fmt_datetime()
 
     # Отправляем уведомление в группу
     await update.message.reply_text(
-        f"✅ Прибытие зафиксировано в {arrived_at}\n\n"
-        f"⏳ Ожидаю ответа диспетчера...\n"
-        f"Если нет ответа через 5 минут — группа диспетчеров будет уведомлена автоматически."
+        f"✅ Arrival confirmed at {arrived_at}\n\n"
+        f"⏳ Waiting for dispatcher response...\n"
+        f"If no response within 5 minutes — dispatcher group will be notified automatically."
     )
 
     # Уведомляем диспетчерскую группу сразу
     await notify_dispatchers(
         context.bot,
-        f"📍 Водитель прибыл!\n\n"
+        f"📍 Driver has arrived!\n\n"
         f"👤 {user.full_name}\n"
-        f"⏰ Время: {arrived_at_full}\n"
+        f"⏰ Time: {arrived_at_full}\n"
         f"💬 {msg_text}\n\n"
-        f"⚠️ Ответьте водителю в течение 5 минут."
+        f"⚠️ Please respond to the driver within 5 minutes."
     )
 
     # Запускаем таймер
@@ -1843,7 +2011,7 @@ async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         name=job_name,
     )
     arrived_pending[job_name] = job_data
-    log.info(f"Таймер прибытия запущен: {user.full_name}, job={job_name}")
+    log.info(f"Arrival timer started: {user.full_name}, job={job_name}")
 
 
 async def handle_dispatcher_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1874,9 +2042,9 @@ async def handle_dispatcher_reply(update: Update, context: ContextTypes.DEFAULT_
             job.schedule_removal()
         data = arrived_pending.pop(job_name, {})
         driver_name = data.get("driver_name", "Водитель")
-        log.info(f"Таймер отменён: диспетчер ответил водителю {driver_name}")
+        log.info(f"Timer cancelled: dispatcher responded to driver {driver_name}")
         await msg.reply_text(
-            f"✅ Ответ зафиксирован. Таймер для {driver_name} остановлен."
+            f"✅ Response recorded. Timer for {driver_name} stopped."
         )
 
 
@@ -1901,9 +2069,9 @@ async def job_alarm_ring(context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⏰ БУДИЛЬНИК! Время: {wake_at}\n\n"
-                f"{driver_name}, вы проснулись?\n"
-                f"Ответьте /awake в течение 2 минут."
+                f"⏰ ALARM! Time: {wake_at}\n\n"
+                f"{driver_name}, are you awake?\n"
+                f"Reply /awake within 2 minutes."
             )
         )
         alarms_pending[job_name] = {**data, "ring_msg_id": msg.message_id}
@@ -1921,7 +2089,7 @@ async def job_alarm_ring(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_alarm_no_response(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Водитель не ответил на будильник — зовём диспетчера."""
+    """Водитель не responded to alarm — зовём диспетчера."""
     data = context.job.data
     chat_id = data["chat_id"]
     driver_name = data["driver_name"]
@@ -1931,16 +2099,16 @@ async def job_alarm_no_response(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Убираем из pending
     alarms_pending.pop(ring_job, None)
 
-    log.warning(f"Водитель {driver_name} не ответил на будильник")
+    log.warning(f"Driver {driver_name} did not respond to alarm")
 
     # Уведомляем группу диспетчеров
     await notify_dispatchers(
         context.bot,
-        f"🚨 ВОДИТЕЛЬ НЕ ОТВЕЧАЕТ НА БУДИЛЬНИК!\n\n"
-        f"👤 Водитель: {driver_name}\n"
-        f"⏰ Будильник был на: {wake_at}\n"
-        f"⏳ 2 минуты прошло — нет ответа.\n\n"
-        f"Пожалуйста, немедленно свяжитесь с водителем!"
+        f"🚨 DRIVER NOT RESPONDING TO ALARM!\n\n"
+        f"👤 Driver: {driver_name}\n"
+        f"⏰ Alarm was set for: {wake_at}\n"
+        f"⏳ 2 minutes passed — no response.\n\n"
+        f"Please contact the driver immediately!"
     )
 
     # Уведомляем группу водителя
@@ -1948,8 +2116,8 @@ async def job_alarm_no_response(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🚨 Нет ответа на будильник!\n"
-                "Диспетчеры уже уведомлены и свяжутся с вами."
+                "🚨 No alarm response!\n"
+                "Dispatchers have been notified and will contact you."
             )
         )
     except Exception as e:
@@ -1964,9 +2132,9 @@ async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return await _set_alarm(update, context, time_str)
 
     await update.message.reply_text(
-        "⏰ Введите время будильника:\n\n"
-        "Формат: <code>14:30</code>\n"
-        "Или через сколько минут: <code>+90</code> (через 90 минут)",
+        "⏰ Enter alarm time:\n\n"
+        "Format: <code>14:30</code>\n"
+        "Or in how many minutes: <code>+90</code> (in 90 minutes)",
         parse_mode="HTML"
     )
     return ALARM_CONV_SET
@@ -1982,7 +2150,7 @@ async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_st
     """Общая логика установки будильника."""
     user = update.effective_user
     chat_id = update.effective_chat.id
-    now = datetime.now()
+    now = now_local()
 
     # Разбираем время
     try:
@@ -1990,7 +2158,7 @@ async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_st
             # Через N минут
             minutes = int(time_str[1:])
             wake_time = now + __import__("datetime").timedelta(minutes=minutes)
-            wake_at = wake_time.strftime("%H:%M")
+            wake_at = wake_time.astimezone(ZoneInfo(TRUCK_TIMEZONE)).strftime("%I:%M %p %Z")
             delay_sec = minutes * 60
         else:
             # Конкретное время HH:MM
@@ -1998,15 +2166,15 @@ async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_st
             from datetime import timedelta
             wake_time = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if wake_time <= now:
-                wake_time += timedelta(days=1)  # если время уже прошло — на завтра
+                wake_time += timedelta(days=1)  # if time already passed — set for tomorrow
             delay_sec = int((wake_time - now).total_seconds())
-            wake_at = wake_time.strftime("%H:%M")
+            wake_at = wake_time.astimezone(ZoneInfo(TRUCK_TIMEZONE)).strftime("%I:%M %p %Z")
     except Exception:
         await update.message.reply_text(
-            "❌ Неверный формат.\n\n"
+            "❌ Invalid format.\n\n"
             "Примеры:\n"
-            "• <code>14:30</code> — в 14:30\n"
-            "• <code>+90</code> — через 90 минут",
+            "• <code>14:30</code> — at 2:30 PM\n"
+            "• <code>+90</code> — in 90 minutes",
             parse_mode="HTML"
         )
         return ALARM_CONV_SET
@@ -2038,11 +2206,11 @@ async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_st
         time_label = f"{mins_left}мин"
 
     await update.message.reply_text(
-        f"⏰ Будильник установлен на {wake_at}\n"
-        f"До сигнала: {time_label}\n\n"
-        f"Когда сработает — ответьте /awake чтобы подтвердить."
+        f"⏰ Alarm set for {wake_at}\n"
+        f"Time until alarm: {time_label}\n\n"
+        f"When it rings — reply /awake to confirm."
     )
-    log.info(f"Будильник: {user.full_name} → {wake_at} (через {delay_sec}с)")
+    log.info(f"Alarm: {user.full_name} → {wake_at} (in {delay_sec}s)")
     return ConversationHandler.END
 
 
@@ -2064,12 +2232,12 @@ async def cmd_awake(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if cancelled:
         await update.message.reply_text(
-            f"✅ {user.full_name} проснулся! Хорошего пути! 🚛"
+            f"✅ {user.full_name} is awake! Safe travels! 🚛"
         )
-        log.info(f"{user.full_name} ответил на будильник")
+        log.info(f"{user.full_name} responded to alarm")
     else:
         await update.message.reply_text(
-            "✅ Принято! Хорошего пути! 🚛"
+            "✅ Confirmed! Safe travels! 🚛"
         )
 
 
@@ -2090,7 +2258,7 @@ def build_alarm_conv():
 # ── ГРУППЫ ДИСПЕТЧЕРОВ ───────────────────────────────────────
 async def sec_dispatchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список групп диспетчеров."""
-    if not is_op(update.effective_user.id):
+    if not is_op_update(update):
         return
     groups = get_dispatcher_groups(active_only=False)
     rows = []
@@ -2105,7 +2273,7 @@ async def sec_dispatchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if groups:
         text += "\n".join(f"• {g['title']} ({g['chat_id']})" for g in groups)
     else:
-        text += "Пока нет групп.\nДобавьте группу диспетчеров чтобы бот мог отправлять туда уведомления."
+        text += "Пока нет групп.\nAdd группу диспетчеров чтобы бот мог отправлять туда уведомления."
 
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
@@ -2115,7 +2283,7 @@ async def cb_disp_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
         "Введите chat_id группы диспетчеров.\n\n"
         "Как узнать ID:\n"
-        "1. Добавьте @RawDataBot в группу диспетчеров\n"
+        "1. Add @RawDataBot в группу диспетчеров\n"
         "2. Скопируйте число из поля chat.id\n"
         "3. Удалите @RawDataBot из группы\n\n"
         "Также добавьте бота в группу диспетчеров!"
@@ -2185,14 +2353,12 @@ def main():
     app.add_handler(build_alarm_conv())
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
-    app.add_handler(CommandHandler("weather", cmd_weather))
     app.add_handler(CommandHandler("arrived", cmd_arrived))
     app.add_handler(CommandHandler("awake", cmd_awake))
     app.add_handler(build_alarm_conv())
 
     # ── ConversationHandler-ы (приоритет над всеми текстовыми) ─
-    app.add_handler(build_routeweather_conv())
-    app.add_handler(build_liveweather_conv())
+    app.add_handler(build_weather_conv())
     app.add_handler(build_operator_conv())
 
     # ── Кнопки меню оператора ─────────────────────────────────
@@ -2239,7 +2405,7 @@ def main():
         # Устанавливаем команды для групп
         from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
         group_commands = [
-            BotCommand("weather",  "🌤 Погода и прогноз на 3 дня"),
+            BotCommand("liveweather", "🌤 Weather / route / live tracking"),
             BotCommand("arrived",  "📍 Уведомить о прибытии"),
             BotCommand("alarm",    "⏰ Установить будильник"),
             BotCommand("awake",    "✅ Я проснулся"),
@@ -2247,20 +2413,39 @@ def main():
         ]
         private_commands = [
             BotCommand("start",    "👨‍💼 Панель оператора"),
-            BotCommand("weather",  "🌤 Погода в городе"),
+            BotCommand("liveweather", "🌤 Weather / route / live tracking"),
             BotCommand("myid",     "🔑 Мой Telegram ID"),
+            BotCommand("cancel",   "❌ Отменить действие"),
+        ]
+        # Команды для операторских групп
+        operator_group_commands = [
+            BotCommand("start",    "👨‍💼 Панель оператора"),
+            BotCommand("liveweather", "🌤 Weather / route / live tracking"),
+            BotCommand("myid",     "🔑 Мой Telegram ID"),
+            BotCommand("chatid",   "📢 ID этого чата"),
             BotCommand("cancel",   "❌ Отменить действие"),
         ]
         try:
             await app.bot.set_my_commands(group_commands,   scope=BotCommandScopeAllGroupChats())
             await app.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
-            log.info("Команды бота установлены.")
+            # Устанавливаем расширенные команды для группы диспетчеров
+            from telegram import BotCommandScopeChat
+            for op_chat_id in OPERATOR_CHAT_IDS:
+                try:
+                    await app.bot.set_my_commands(
+                        operator_group_commands,
+                        scope=BotCommandScopeChat(chat_id=op_chat_id)
+                    )
+                    log.info(f"Operator commands set for chat {op_chat_id}")
+                except Exception as e2:
+                    log.warning(f"Команды для чата {op_chat_id}: {e2}")
+            log.info("Bot commands set.")
         except Exception as e:
-            log.warning(f"Не удалось установить команды: {e}")
+            log.warning(f"Failed to set commands: {e}")
 
     app.post_init = on_start
 
-    log.info(f"Бот запущен. TEST_MODE={TEST_MODE}")
+    log.info(f"Bot started. TEST_MODE={TEST_MODE}, TZ={TRUCK_TIMEZONE}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
