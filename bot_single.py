@@ -146,14 +146,14 @@ def init_db():
             pass
         if conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0] == 0:
             conn.executemany("INSERT INTO templates (title, text) VALUES (?, ?)", [
-                ("PTI напоминание",
-                 "📋 Выполните Pre-Trip Inspection перед выездом.\n\nПроверьте: документы, шины, тормоза, фары, прицеп.\nSafe truck = Safe driver ✅"),
-                ("Давление в колёсах",
-                 "🛞 Проверьте давление в шинах:\n• Передние (steer): 110–120 PSI\n• Задние (drive): 95–105 PSI"),
+                ("PTI Reminder",
+                 "📋 Complete Pre-Trip Inspection before departure.\n\nCheck: documents, tires, brakes, lights, trailer.\nSafe truck = Safe driver ✅"),
+                ("Tire Pressure Check",
+                 "🛞 Check tire pressure:\n• Steer (front): 110–120 PSI\n• Drive (rear): 95–105 PSI"),
                 ("DOT Inspection Week",
-                 "🚨 DOT Inspection Week!\n\nУбедитесь, что все документы в порядке:\nCDL, Medical Card, Registration, Insurance, ELD."),
+                 "🚨 DOT Inspection Week!\n\nMake sure all documents are in order:\nCDL, Medical Card, Registration, Insurance, ELD."),
                 ("Техника безопасности",
-                 "⚠️ Напоминание о безопасности:\n\n• Пристегните ремень\n• Соблюдайте скоростной режим\n• Перерыв каждые 4 часа\n• При усталости — остановитесь"),
+                 "⚠️ Напоминание о безопасности:\n\n• Пристегните ремень\n• Соблюдайте скоростной режим\n• Перерыв every 4 hours\n• При усталости — остановитесь"),
             ])
 
 
@@ -278,7 +278,7 @@ def parse_cron(expr):
     if t.startswith("*/") and t.endswith("m"):
         return {"type": "interval", "seconds": int(t[2:-1]) * 60}
     if ":" not in t:
-        raise ValueError(f"Неверный формат: '{expr}'")
+        raise ValueError(f"Invalid schedule format: '{expr}'. Use 09:00, */4h or */10m")
     hh, mm = map(int, t.split(":"))
     r = {"type": "daily", "time": dtime(hour=hh, minute=mm)}
     if extra:
@@ -330,7 +330,7 @@ def register_schedule(app, s):
             time=cron["time"].replace(tzinfo=ZoneInfo(TRUCK_TIMEZONE)),
             days=days, data=data, name=name
         )
-    log.info(f"Расписание: {name}")
+    log.info(f"Schedule: {name}")
 
 
 def unregister_schedule(app, sid):
@@ -388,18 +388,15 @@ def analyze_truck_hazards(w: dict) -> list[str]:
     # 1. Критичный ветер — риск опрокидывания фуры
     if wind_gust >= WIND_DANGER_MPH:
         alerts.append(
-            f"🚨 КРИТИЧНО: gusts ветра {wind_gust:.0f} mph — "
-            f"высокий риск опрокидывания фуры! Остановитесь."
+            f"🚨 CRITICAL: wind gusts {wind_gust:.0f} mph — high rollover risk! Stop immediately."
         )
     elif wind_spd >= WIND_DANGER_MPH:
         alerts.append(
-            f"🚨 ОПАСНО: боковой ветер {wind_spd:.0f} mph — "
-            f"держитесь дальше от отбойников, снизьте скорость."
+            f"🚨 DANGEROUS: crosswind {wind_spd:.0f} mph — stay away from barriers, reduce speed."
         )
     elif wind_spd >= WIND_CAUTION_MPH or wind_gust >= WIND_CAUTION_MPH:
         alerts.append(
-            f"⚠️ Сильный ветер {wind_spd:.0f} mph "
-            f"(gusts до {wind_gust:.0f} mph) — снизьте скорость."
+            f"⚠️ Strong wind {wind_spd:.0f} mph (gusts {wind_gust:.0f} mph) — reduce speed."
         )
 
     # 2. Видимость
@@ -594,7 +591,7 @@ def get_weather_data(lat: float, lon: float) -> dict | None:
         return None
     try:
         url = (f"https://api.openweathermap.org/data/2.5/weather"
-               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru")
+               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=en")
         return _fetch_json(url)
     except Exception as e:
         log.warning(f"Weather ({lat},{lon}): {e}")
@@ -607,7 +604,7 @@ def get_forecast_data(lat: float, lon: float) -> dict | None:
         return None
     try:
         url = (f"https://api.openweathermap.org/data/2.5/forecast"
-               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=ru&cnt=24")
+               f"?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units={WEATHER_UNITS}&lang=en&cnt=24")
         return _fetch_json(url)
     except Exception as e:
         log.warning(f"Forecast ({lat},{lon}): {e}")
@@ -651,9 +648,9 @@ async def wx_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "wx_live":
         await q.message.chat.send_message(
-            "📡 Укажите маршрут через /:\n\n"
+            "📡 Enter route using /:\n\n"
             "<code>New York / Cleveland / Chicago</code>\n\n"
-            "Затем включите: 📎 Скрепка → Location → Share Live Location",
+            "Then enable: 📎 Paperclip → Location → Share Live Location",
             parse_mode="HTML"
         )
         return WX_ROUTE
@@ -690,9 +687,9 @@ async def wx_get_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает точку А маршрута."""
     context.user_data["wx_origin"] = update.message.text.strip()
     await update.message.reply_text(
-        f"✅ Старт: {context.user_data['wx_origin']}\n\n"
-        "Теперь введите пункт назначения:\n"
-        "Например: <code>Teterboro, NJ</code>",
+        f"✅ Start: {context.user_data['wx_origin']}\n\n"
+        "Now enter destination:\n"
+        "Example: <code>Teterboro, NJ</code>",
         parse_mode="HTML"
     )
     return WX_DEST
@@ -718,7 +715,7 @@ async def wx_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await msg.edit_text("❌ Cities not found. Check the names.")
     else:
-        await msg.edit_text(f"🗺 {origin} → {dest}\nТочек: {len(cities)}\nGetting weather...")
+        await msg.edit_text(f"🗺 {origin} → {dest}\nStops: {len(cities)}\nGetting weather...")
         await send_route_weather(context.bot, chat_id, cities, origin, dest)
     return ConversationHandler.END
 
@@ -733,7 +730,7 @@ async def wx_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return WX_ROUTE
-    await update.message.reply_text(f"📋 Маршрут: {' → '.join(cities_raw)}\nGetting weather...")
+    await update.message.reply_text(f"📋 Route: {' → '.join(cities_raw)}\nGetting weather...")
     city_dicts = [geo for c in cities_raw if (geo := geocode_city(c))]
     if len(city_dicts) >= 2:
         await send_route_weather(context.bot, chat_id, city_dicts, cities_raw[0], cities_raw[-1])
@@ -741,7 +738,7 @@ async def wx_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not find cities.")
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📎 Включите живую геолокацию:\nСкрепка → Location → Share Live Location"
+        text="📎 Включите живую геолокацию:\nPaperclip → Location → Share Live Location"
     )
     return ConversationHandler.END
 
@@ -1103,7 +1100,7 @@ async def cb_autotrip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text("❌ Could not find cities in the message.")
         return
 
-    await q.message.edit_text(f"📋 Маршрут: {' → '.join(cities)}\n\nGetting weather...")
+    await q.message.edit_text(f"📋 Route: {' → '.join(cities)}\n\nGetting weather...")
     chat_id = saved["chat_id"]
 
     city_dicts = []
@@ -1140,8 +1137,8 @@ async def rw_get_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["rw_origin"] = update.message.text.strip()
     await update.message.reply_text(
         f"✅ Старт: {context.user_data['rw_origin']}\n\n"
-        "Теперь введите пункт назначения:\n"
-        "Например: <code>Teterboro, NJ</code>",
+        "Now enter destination:\n"
+        "Example: <code>Teterboro, NJ</code>",
         parse_mode="HTML"
     )
     return RW_DEST
@@ -1170,7 +1167,7 @@ async def rw_get_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id=chat_id, text="❌ Cities not found. Check the names.")
     else:
-        await msg.edit_text(f"🗺 {origin} → {dest}\nТочек: {len(cities)}\nGetting weather...")
+        await msg.edit_text(f"🗺 {origin} → {dest}\nStops: {len(cities)}\nGetting weather...")
         await send_route_weather(context.bot, chat_id, cities, origin, dest)
 
     return ConversationHandler.END
@@ -1207,7 +1204,7 @@ async def lw_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нужно минимум 2 города.\nПример: <code>New York / Chicago</code>", parse_mode="HTML")
         return LW_ROUTE
 
-    await update.message.reply_text(f"📋 Маршрут: {' → '.join(cities_raw)}\nGetting weather...")
+    await update.message.reply_text(f"📋 Route: {' → '.join(cities_raw)}\nGetting weather...")
 
     city_dicts = []
     for c in cities_raw:
@@ -1222,7 +1219,7 @@ async def lw_get_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📎 Теперь включите живую геолокацию:\nСкрепка → Location → Share Live Location"
+        text="📎 Теперь включите живую геолокацию:\nPaperclip → Location → Share Live Location"
     )
     return ConversationHandler.END
 
@@ -1252,16 +1249,16 @@ def is_op_update(update) -> bool:
 
 def kb_op():
     return ReplyKeyboardMarkup([
-        ["👥 Водители", "📋 Шаблоны"],
-        ["🕐 Расписания", "📨 Рассылка"],
-        ["📢 Диспетчеры"],
+        ["👥 Drivers", "📋 Templates"],
+        ["🕐 Schedules", "📨 Broadcast"],
+        ["📢 Dispatcherы"],
     ], resize_keyboard=True)
 
 def kb_back(cb="back_main"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=cb)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data=cb)]])
 
 def drivers_kb():
-    rows = [[InlineKeyboardButton("📢 Всем водителям", callback_data="target_all")]]
+    rows = [[InlineKeyboardButton("📢 All drivers", callback_data="target_all")]]
     for d in get_all_drivers():
         rows.append([InlineKeyboardButton(f"👤 {d['name']}", callback_data=f"target_{d['chat_id']}")])
     return InlineKeyboardMarkup(rows)
@@ -1289,7 +1286,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_op(uid, chat_id):
         # Оператор (лично или из группы диспетчеров) — показываем панель
-        await update.message.reply_text("👨‍💼 Панель оператора:", reply_markup=kb_op())
+        await update.message.reply_text("👨‍💼 Operator panel:", reply_markup=kb_op())
     elif chat_type in ("group", "supergroup"):
         # Группа водителя — только команды водителя
         await update.message.reply_text(
@@ -1331,7 +1328,7 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
-        f"👤 Ваш ID: <code>{uid}</code>\n"
+        f"👤 Your ID: <code>{uid}</code>\n"
         f"Operator: {'✅' if is_op(uid) else '❌'}\n"
         f"OPERATOR_IDS: <code>{OPERATOR_IDS}</code>",
         parse_mode="HTML"
@@ -1346,22 +1343,22 @@ async def sec_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("✅ " if d["active"] else "❌ ") + d["name"],
         callback_data=f"drv_edit_{d['chat_id']}"
     )] for d in drivers]
-    rows.append([InlineKeyboardButton("➕ Добавить водителя", callback_data="drv_add")])
-    text = "👥 Водители:\n" + "\n".join(
+    rows.append([InlineKeyboardButton("➕ Add driver", callback_data="drv_add")])
+    text = "👥 Drivers:\n" + "\n".join(
         f"{'✅' if d['active'] else '❌'} {d['name']} ({d['chat_id']})" for d in drivers
-    ) if drivers else "👥 Пока нет водителей."
+    ) if drivers else "👥 No drivers yet."
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_drv_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Введите имя водителя:")
+    await update.callback_query.message.reply_text("Enter driver name:")
     return ST_DRV_NAME
 
 
 async def st_drv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["drv_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите chat_id группы водителя.\n\nКак узнать: добавьте @RawDataBot в группу.")
+    await update.message.reply_text("Enter the driver group chat_id.\n\nHow to get it: add @RawDataBot to the group.")
     return ST_DRV_CHAT
 
 
@@ -1369,13 +1366,13 @@ async def st_drv_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cid = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("Неверный формат. Введите числовой ID:")
+        await update.message.reply_text("Invalid format. Enter numeric ID:")
         return ST_DRV_CHAT
     name = context.user_data.pop("drv_name", "Водитель")
     if add_driver(cid, name):
-        await update.message.reply_text(f"✅ Водитель {name} добавлен.", reply_markup=kb_op())
+        await update.message.reply_text(f"✅ Водитель {name} added.", reply_markup=kb_op())
     else:
-        await update.message.reply_text(f"⚠️ Водитель с chat_id {cid} уже существует.", reply_markup=kb_op())
+        await update.message.reply_text(f"⚠️ Водитель с chat_id {cid} already exists.", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1385,15 +1382,15 @@ async def cb_drv_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = int(q.data.split("_")[-1])
     d = get_driver(cid)
     if not d:
-        await q.message.reply_text("Не найден.")
+        await q.message.reply_text("Not found.")
         return
     lbl = "Деактивировать" if d["active"] else "Активировать"
     await q.message.reply_text(
         f"Водитель: {d['name']}\nЧат: {cid}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(f"🔄 {lbl}", callback_data=f"drv_toggle_{cid}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"drv_del_{cid}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="nav_drivers")],
+            [InlineKeyboardButton("🗑 Delete", callback_data=f"drv_del_{cid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data="nav_drivers")],
         ])
     )
 
@@ -1405,7 +1402,7 @@ async def cb_drv_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = get_driver(cid)
     if d:
         toggle_driver(cid, not d["active"])
-        s = "активирован ✅" if not d["active"] else "деактивирован ❌"
+        s = "activated ✅" if not d["active"] else "deactivated ❌"
         await q.message.reply_text(f"Водитель {d['name']} {s}.")
 
 
@@ -1416,7 +1413,7 @@ async def cb_drv_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = get_driver(cid)
     if d:
         delete_driver(cid)
-        await q.message.reply_text(f"🗑 {d['name']} удалён.")
+        await q.message.reply_text(f"🗑 {d['name']} removed.")
 
 
 # ── ШАБЛОНЫ ──────────────────────────────────────────────────
@@ -1424,8 +1421,8 @@ async def sec_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_op_update(update): return
     tpls = get_templates()
     rows = [[InlineKeyboardButton(t["title"], callback_data=f"tpl_view_{t['id']}")] for t in tpls]
-    rows.append([InlineKeyboardButton("➕ Новый шаблон", callback_data="tpl_add")])
-    await update.message.reply_text("📋 Шаблоны:", reply_markup=InlineKeyboardMarkup(rows))
+    rows.append([InlineKeyboardButton("➕ New template", callback_data="tpl_add")])
+    await update.message.reply_text("📋 Templates:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_tpl_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1437,29 +1434,29 @@ async def cb_tpl_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"📋 {t['title']}\n\n{t['text']}",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📨 Отправить", callback_data=f"tpl_send_{tid}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tpl_del_{tid}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="nav_templates")],
+            [InlineKeyboardButton("📨 Send", callback_data=f"tpl_send_{tid}")],
+            [InlineKeyboardButton("🗑 Delete", callback_data=f"tpl_del_{tid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data="nav_templates")],
         ])
     )
 
 
 async def cb_tpl_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Введите название шаблона:")
+    await update.callback_query.message.reply_text("Enter template name:")
     return ST_TPL_TITLE
 
 
 async def st_tpl_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tpl_title"] = update.message.text.strip()
-    await update.message.reply_text("Введите текст шаблона:")
+    await update.message.reply_text("Enter template text:")
     return ST_TPL_TEXT
 
 
 async def st_tpl_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = context.user_data.pop("tpl_title", "")
     add_template(title, update.message.text.strip())
-    await update.message.reply_text(f"✅ Шаблон «{title}» сохранён.", reply_markup=kb_op())
+    await update.message.reply_text(f"✅ Шаблон «{title}» saved.", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1470,7 +1467,7 @@ async def cb_tpl_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = get_template(tid)
     if t:
         delete_template(tid)
-        await q.message.reply_text(f"🗑 «{t['title']}» удалён.")
+        await q.message.reply_text(f"🗑 «{t['title']}» removed.")
 
 
 async def cb_tpl_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1492,8 +1489,8 @@ async def sec_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("✅ " if s["active"] else "⏸ ") + f"{s['title']} ({s['cron_expr']})",
         callback_data=f"sch_view_{s['id']}"
     )] for s in scheds]
-    rows.append([InlineKeyboardButton("➕ Новое расписание", callback_data="sch_add")])
-    await update.message.reply_text("🕐 Расписания:", reply_markup=InlineKeyboardMarkup(rows))
+    rows.append([InlineKeyboardButton("➕ New schedule", callback_data="sch_add")])
+    await update.message.reply_text("🕐 Schedules:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_sch_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1502,27 +1499,27 @@ async def cb_sch_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sid = int(q.data.split("_")[-1])
     s = get_schedule(sid)
     if not s: return
-    tgt = "Все водители" if s["target"] == "all" else s["target"]
-    lbl = "⏸ Приостановить" if s["active"] else "▶️ Возобновить"
+    tgt = "All drivers" if s["target"] == "all" else s["target"]
+    lbl = "⏸ Pause" if s["active"] else "▶️ Resume"
     await q.message.reply_text(
-        f"🕐 {s['title']}\nРасписание: {s['cron_expr']}\nПолучатели: {tgt}\n\n{s['text'] or '(без текста)'}",
+        f"🕐 {s['title']}\nSchedule: {s['cron_expr']}\nRecipients: {tgt}\n\n{s['text'] or '(без текста)'}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(lbl, callback_data=f"sch_toggle_{sid}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"sch_del_{sid}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="nav_schedules")],
+            [InlineKeyboardButton("🗑 Delete", callback_data=f"sch_del_{sid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data="nav_schedules")],
         ])
     )
 
 
 async def cb_sch_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Введите название расписания:")
+    await update.callback_query.message.reply_text("Enter schedule name:")
     return ST_SCH_TITLE
 
 
 async def st_sch_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sch_title"] = update.message.text.strip()
-    await update.message.reply_text("Введите текст уведомления (или отправьте фото/файл):")
+    await update.message.reply_text("Enter notification text (or send photo/file):")
     return ST_SCH_TEXT
 
 
@@ -1536,12 +1533,12 @@ async def st_sch_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         context.user_data["sch_text"] = update.message.text.strip()
     await update.message.reply_text(
-        "Введите расписание:\n\n"
-        "<code>09:00</code> — каждый день\n"
-        "<code>08:00|mon,wed,fri</code> — пн, ср, пт\n"
-        "<code>09:00|1</code> — первая неделя месяца\n"
-        "<code>*/4h</code> — каждые 4 часа\n"
-        "<code>*/10m</code> — каждые 10 минут",
+        "Enter schedule:\n\n"
+        "<code>09:00</code> — every day\n"
+        "<code>08:00|mon,wed,fri</code> — Mon, Wed, Fri\n"
+        "<code>09:00|1</code> — first week of month\n"
+        "<code>*/4h</code> — every 4 hours\n"
+        "<code>*/10m</code> — every 10 minutes",
         parse_mode="HTML"
     )
     return ST_SCH_CRON
@@ -1549,7 +1546,7 @@ async def st_sch_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def st_sch_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sch_cron"] = update.message.text.strip()
-    await update.message.reply_text("Кому отправлять?", reply_markup=drivers_kb())
+    await update.message.reply_text("Who to send to?", reply_markup=drivers_kb())
     return ST_SCH_TARGET
 
 
@@ -1566,7 +1563,7 @@ async def st_sch_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id=context.user_data.pop("sch_doc", None),
     )
     register_schedule(context.application, dict(get_schedule(sid)))
-    await q.message.reply_text("✅ Расписание создано.", reply_markup=kb_op())
+    await q.message.reply_text("✅ Schedule created.", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1580,10 +1577,10 @@ async def cb_sch_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_schedule(sid, active=new_active)
     if new_active:
         register_schedule(context.application, dict(get_schedule(sid)))
-        await q.message.reply_text(f"▶️ «{s['title']}» возобновлено.")
+        await q.message.reply_text(f"▶️ «{s['title']}» resumed.")
     else:
         unregister_schedule(context.application, sid)
-        await q.message.reply_text(f"⏸ «{s['title']}» приостановлено.")
+        await q.message.reply_text(f"⏸ «{s['title']}» paused.")
 
 
 async def cb_sch_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1594,13 +1591,13 @@ async def cb_sch_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if s:
         unregister_schedule(context.application, sid)
         delete_schedule(sid)
-        await q.message.reply_text(f"🗑 «{s['title']}» удалено.")
+        await q.message.reply_text(f"🗑 «{s['title']}» removed.")
 
 
 # ── РАССЫЛКА ─────────────────────────────────────────────────
 async def sec_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_op_update(update): return ConversationHandler.END
-    await update.message.reply_text("📨 Введите текст (или отправьте фото/файл с подписью):")
+    await update.message.reply_text("📨 Enter text (or send photo/file with caption):")
     return ST_BC_TEXT
 
 
@@ -1613,7 +1610,7 @@ async def st_bc_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["bc_text"] = update.message.caption or ""
     else:
         context.user_data["bc_text"] = update.message.text.strip()
-    await update.message.reply_text("Кому отправить?", reply_markup=drivers_kb())
+    await update.message.reply_text("Who to send to?", reply_markup=drivers_kb())
     return ST_BC_TARGET
 
 
@@ -1638,7 +1635,7 @@ async def st_bc_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent += 1
         except Exception as e:
             log.warning(f"Broadcast → {cid}: {e}")
-    await q.message.reply_text(f"✅ Отправлено: {sent}/{len(chat_ids)}", reply_markup=kb_op())
+    await q.message.reply_text(f"✅ Sent: {sent}/{len(chat_ids)}", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1663,27 +1660,27 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if q.data == "back_main":
-        await q.message.reply_text("Главное меню:", reply_markup=kb_op())
+        await q.message.reply_text("Main menu:", reply_markup=kb_op())
     elif q.data == "nav_drivers":
         drivers = get_all_drivers(active_only=False)
         rows = [[InlineKeyboardButton(("✅ " if d["active"] else "❌ ") + d["name"], callback_data=f"drv_edit_{d['chat_id']}")] for d in drivers]
         rows.append([InlineKeyboardButton("➕ Добавить", callback_data="drv_add")])
-        await q.message.reply_text("👥 Водители:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.reply_text("👥 Drivers:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_templates":
         tpls = get_templates()
         rows = [[InlineKeyboardButton(t["title"], callback_data=f"tpl_view_{t['id']}")] for t in tpls]
         rows.append([InlineKeyboardButton("➕ Новый", callback_data="tpl_add")])
-        await q.message.reply_text("📋 Шаблоны:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.reply_text("📋 Templates:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_dispatchers":
         groups = get_dispatcher_groups(active_only=False)
         rows = [[InlineKeyboardButton(f"📢 {g['title']}", callback_data=f"disp_del_{g['chat_id']}")] for g in groups]
         rows.append([InlineKeyboardButton("➕ Добавить", callback_data="disp_add")])
-        await q.message.reply_text("📢 Группы диспетчеров:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.reply_text("📢 Dispatcher groups:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_schedules":
         scheds = get_schedules()
         rows = [[InlineKeyboardButton(("✅ " if s["active"] else "⏸ ") + s["title"], callback_data=f"sch_view_{s['id']}")] for s in scheds]
         rows.append([InlineKeyboardButton("➕ Новое", callback_data="sch_add")])
-        await q.message.reply_text("🕐 Расписания:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.reply_text("🕐 Schedules:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1735,7 +1732,7 @@ def build_operator_conv():
             CallbackQueryHandler(cb_tpl_send,  pattern=r"^tpl_send_\d+$"),
             CallbackQueryHandler(cb_sch_add,   pattern="^sch_add$"),
             CallbackQueryHandler(cb_disp_add,  pattern="^disp_add$"),
-            MessageHandler(filters.Regex("^📨 Рассылка$"), sec_broadcast),
+            MessageHandler(filters.Regex("^📨 Broadcast$"), sec_broadcast),
         ],
         states={
             ST_DRV_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_drv_name)],
@@ -1783,7 +1780,7 @@ async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arrive_text = (
         f"🏁 {driver} прибыл на место!{location_text}\n\n"
         f"⏳ Ожидаю подтверждения от диспетчера...\n"
-        f"Диспетчер: нажмите кнопку ниже или ответьте на сообщение."
+        f"Dispatcher: нажмите кнопку ниже или ответьте на сообщение."
     )
     job_name = f"arrived_{user_id}_{chat_id}"
     sent_msg = await update.message.reply_text(
@@ -1866,13 +1863,13 @@ async def job_arrived_escalate(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_confirm_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Диспетчер подтверждает прибытие."""
+    """Dispatcher подтверждает прибытие."""
     q = update.callback_query
     await q.answer("✅ Прибытие подтверждено!")
 
     job_name   = q.data.replace("confirm_arrived_", "")
     data       = arrived_pending.get(job_name)
-    dispatcher = update.effective_user.full_name or "Диспетчер"
+    dispatcher = update.effective_user.full_name or "Dispatcher"
 
     if not data:
         await q.message.edit_reply_markup(reply_markup=None)
@@ -2134,7 +2131,7 @@ async def cmd_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "⏰ Enter alarm time:\n\n"
         "Format: <code>14:30</code>\n"
-        "Or in how many minutes: <code>+90</code> (in 90 minutes)",
+        "Or minutes from now: <code>+90</code>",
         parse_mode="HTML"
     )
     return ALARM_CONV_SET
@@ -2173,7 +2170,7 @@ async def _set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE, time_st
         await update.message.reply_text(
             "❌ Invalid format.\n\n"
             "Примеры:\n"
-            "• <code>14:30</code> — at 2:30 PM\n"
+            "• <code>14:30</code> — at that time\n"
             "• <code>+90</code> — in 90 minutes",
             parse_mode="HTML"
         )
@@ -2267,13 +2264,13 @@ async def sec_dispatchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📢 {g['title']} ({g['chat_id']})",
             callback_data=f"disp_del_{g['chat_id']}"
         )])
-    rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="disp_add")])
+    rows.append([InlineKeyboardButton("➕ Add group", callback_data="disp_add")])
 
-    text = "📢 Группы диспетчеров:\n\n"
+    text = "📢 Dispatcher groups:\n\n"
     if groups:
         text += "\n".join(f"• {g['title']} ({g['chat_id']})" for g in groups)
     else:
-        text += "Пока нет групп.\nAdd группу диспетчеров чтобы бот мог отправлять туда уведомления."
+        text += "No groups yet.\nAdd группу диспетчеров чтобы бот мог отправлять туда уведомления."
 
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
@@ -2281,12 +2278,12 @@ async def sec_dispatchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_disp_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text(
-        "Введите chat_id группы диспетчеров.\n\n"
-        "Как узнать ID:\n"
+        "Enter the dispatcher group chat_id.\n\n"
+        "How to get the ID:\n"
         "1. Add @RawDataBot в группу диспетчеров\n"
-        "2. Скопируйте число из поля chat.id\n"
-        "3. Удалите @RawDataBot из группы\n\n"
-        "Также добавьте бота в группу диспетчеров!"
+        "2. Copy the number from the chat.id field\n"
+        "3. Remove @RawDataBot from the group\n\n"
+        "Also add the bot to the dispatcher group!"
     )
     return ST_DISP_CHAT
 
@@ -2295,10 +2292,10 @@ async def st_disp_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("Неверный формат. Введите числовой ID:")
+        await update.message.reply_text("Invalid format. Enter numeric ID:")
         return ST_DISP_CHAT
     context.user_data["disp_chat_id"] = chat_id
-    await update.message.reply_text("Введите название группы (например: Диспетчеры Москва):")
+    await update.message.reply_text("Enter group name (e.g.: Dispatchers NY):")
     return ST_DISP_TITLE
 
 
@@ -2307,10 +2304,10 @@ async def st_disp_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.user_data.pop("disp_chat_id", 0)
     add_dispatcher_group(chat_id, title)
     await update.message.reply_text(
-        f"✅ Группа диспетчеров добавлена!\n\n"
+        f"✅ Dispatcher group added!\n\n"
         f"📢 {title}\n"
         f"ID: {chat_id}\n\n"
-        "Теперь бот будет отправлять туда уведомления о прибытии и будильниках.",
+        "Bot will now send arrival and alarm notifications there.",
         reply_markup=kb_op()
     )
     return ConversationHandler.END
@@ -2324,10 +2321,10 @@ async def cb_disp_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     g = next((x for x in groups if x["chat_id"] == chat_id), None)
     if g:
         await q.message.reply_text(
-            f"Удалить группу «{g['title']}»?",
+            f"Remove group «{g['title']}»?",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Удалить", callback_data=f"disp_confirm_del_{chat_id}"),
-                InlineKeyboardButton("◀️ Отмена", callback_data="nav_dispatchers"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"disp_confirm_del_{chat_id}"),
+                InlineKeyboardButton("◀️ Cancel", callback_data="nav_dispatchers"),
             ]])
         )
 
@@ -2337,12 +2334,12 @@ async def cb_disp_confirm_del(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.answer()
     chat_id = int(q.data.split("_")[-1])
     delete_dispatcher_group(chat_id)
-    await q.message.reply_text("🗑 Группа удалена.", reply_markup=kb_op())
+    await q.message.reply_text("🗑 Группа removed.", reply_markup=kb_op())
 
 
 def main():
     init_db()
-    log.info("БД инициализирована.")
+    log.info("DB initialized.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -2362,10 +2359,10 @@ def main():
     app.add_handler(build_operator_conv())
 
     # ── Кнопки меню оператора ─────────────────────────────────
-    app.add_handler(MessageHandler(filters.Regex("^👥 Водители$"), sec_drivers))
-    app.add_handler(MessageHandler(filters.Regex("^📢 Диспетчеры$"), sec_dispatchers))
-    app.add_handler(MessageHandler(filters.Regex("^📋 Шаблоны$"), sec_templates))
-    app.add_handler(MessageHandler(filters.Regex("^🕐 Расписания$"), sec_schedules))
+    app.add_handler(MessageHandler(filters.Regex("^👥 Drivers$"), sec_drivers))
+    app.add_handler(MessageHandler(filters.Regex("^📢 Dispatcherы$"), sec_dispatchers))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Templates$"), sec_templates))
+    app.add_handler(MessageHandler(filters.Regex("^🕐 Schedules$"), sec_schedules))
 
     # ── Ответ диспетчера — отменяет таймер ─────────────────────
     app.add_handler(MessageHandler(
@@ -2400,30 +2397,31 @@ def main():
 
     async def on_start(app):
         register_all_schedules(app)
-        log.info("Расписания загружены.")
+        log.info("Schedules loaded.")
 
         # Устанавливаем команды для групп
         from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
         group_commands = [
             BotCommand("liveweather", "🌤 Weather / route / live tracking"),
-            BotCommand("arrived",  "📍 Уведомить о прибытии"),
-            BotCommand("alarm",    "⏰ Установить будильник"),
-            BotCommand("awake",    "✅ Я проснулся"),
-            BotCommand("cancel",   "❌ Отменить действие"),
+            BotCommand("arrived",     "📍 Notify dispatcher of arrival"),
+            BotCommand("alarm",       "⏰ Set wake-up alarm"),
+            BotCommand("awake",       "✅ Confirm I'm awake"),
+            BotCommand("cancel",      "❌ Cancel current action"),
         ]
         private_commands = [
-            BotCommand("start",    "👨‍💼 Панель оператора"),
+            BotCommand("start",       "👨‍💼 Operator panel"),
             BotCommand("liveweather", "🌤 Weather / route / live tracking"),
-            BotCommand("myid",     "🔑 Мой Telegram ID"),
-            BotCommand("cancel",   "❌ Отменить действие"),
+            BotCommand("myid",        "🔑 My Telegram ID"),
+            BotCommand("chatid",      "📢 Get this chat ID"),
+            BotCommand("cancel",      "❌ Cancel current action"),
         ]
         # Команды для операторских групп
         operator_group_commands = [
-            BotCommand("start",    "👨‍💼 Панель оператора"),
-            BotCommand("liveweather", "🌤 Weather / route / live tracking"),
-            BotCommand("myid",     "🔑 Мой Telegram ID"),
-            BotCommand("chatid",   "📢 ID этого чата"),
-            BotCommand("cancel",   "❌ Отменить действие"),
+            BotCommand("start",    "👨‍💼 Operator panel"),
+            BotCommand("liveweather", "🌤 Weather / route / tracking"),
+            BotCommand("myid",     "🔑 My Telegram ID"),
+            BotCommand("chatid",   "📢 This chat ID"),
+            BotCommand("cancel",   "❌ Cancel action"),
         ]
         try:
             await app.bot.set_my_commands(group_commands,   scope=BotCommandScopeAllGroupChats())
