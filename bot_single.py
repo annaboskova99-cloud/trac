@@ -1075,7 +1075,7 @@ async def auto_detect_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         "🚛 Вижу сообщение с маршрутом!\nОтправить погоду по всем точкам?",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Да", callback_data=f"autotrip_{msg.message_id}"),
+            InlineKeyboardButton("✅ Yes", callback_data=f"autotrip_{msg.message_id}"),
             InlineKeyboardButton("❌ No", callback_data="autotrip_cancel"),
         ]])
     )
@@ -1251,7 +1251,7 @@ def kb_op():
     return ReplyKeyboardMarkup([
         ["👥 Drivers", "📋 Templates"],
         ["🕐 Schedules", "📨 Broadcast"],
-        ["📢 Dispatcherы"],
+        ["📢 Dispatchers"],
     ], resize_keyboard=True)
 
 def kb_back(cb="back_main"):
@@ -1370,9 +1370,9 @@ async def st_drv_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_DRV_CHAT
     name = context.user_data.pop("drv_name", "Водитель")
     if add_driver(cid, name):
-        await update.message.reply_text(f"✅ Водитель {name} added.", reply_markup=kb_op())
+        await update.message.reply_text(f"✅ Driver {name} added.", reply_markup=kb_op())
     else:
-        await update.message.reply_text(f"⚠️ Водитель с chat_id {cid} already exists.", reply_markup=kb_op())
+        await update.message.reply_text(f"⚠️ Driver with chat_id {cid} already exists.", reply_markup=kb_op())
     return ConversationHandler.END
 
 
@@ -1664,22 +1664,22 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "nav_drivers":
         drivers = get_all_drivers(active_only=False)
         rows = [[InlineKeyboardButton(("✅ " if d["active"] else "❌ ") + d["name"], callback_data=f"drv_edit_{d['chat_id']}")] for d in drivers]
-        rows.append([InlineKeyboardButton("➕ Добавить", callback_data="drv_add")])
+        rows.append([InlineKeyboardButton("➕ Add", callback_data="drv_add")])
         await q.message.reply_text("👥 Drivers:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_templates":
         tpls = get_templates()
         rows = [[InlineKeyboardButton(t["title"], callback_data=f"tpl_view_{t['id']}")] for t in tpls]
-        rows.append([InlineKeyboardButton("➕ Новый", callback_data="tpl_add")])
+        rows.append([InlineKeyboardButton("➕ New", callback_data="tpl_add")])
         await q.message.reply_text("📋 Templates:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_dispatchers":
         groups = get_dispatcher_groups(active_only=False)
         rows = [[InlineKeyboardButton(f"📢 {g['title']}", callback_data=f"disp_del_{g['chat_id']}")] for g in groups]
-        rows.append([InlineKeyboardButton("➕ Добавить", callback_data="disp_add")])
+        rows.append([InlineKeyboardButton("➕ Add", callback_data="disp_add")])
         await q.message.reply_text("📢 Dispatcher groups:", reply_markup=InlineKeyboardMarkup(rows))
     elif q.data == "nav_schedules":
         scheds = get_schedules()
         rows = [[InlineKeyboardButton(("✅ " if s["active"] else "⏸ ") + s["title"], callback_data=f"sch_view_{s['id']}")] for s in scheds]
-        rows.append([InlineKeyboardButton("➕ Новое", callback_data="sch_add")])
+        rows.append([InlineKeyboardButton("➕ New", callback_data="sch_add")])
         await q.message.reply_text("🕐 Schedules:", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -1786,7 +1786,7 @@ async def cmd_arrived(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(
         arrive_text,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Подтвердить прибытие", callback_data=f"confirm_arrived_{job_name}"),
+            InlineKeyboardButton("✅ Confirm arrival", callback_data=f"confirm_arrived_{job_name}"),
         ]])
     )
 
@@ -2360,7 +2360,7 @@ def main():
 
     # ── Кнопки меню оператора ─────────────────────────────────
     app.add_handler(MessageHandler(filters.Regex("^👥 Drivers$"), sec_drivers))
-    app.add_handler(MessageHandler(filters.Regex("^📢 Dispatcherы$"), sec_dispatchers))
+    app.add_handler(MessageHandler(filters.Regex("^📢 Dispatchers$"), sec_dispatchers))
     app.add_handler(MessageHandler(filters.Regex("^📋 Templates$"), sec_templates))
     app.add_handler(MessageHandler(filters.Regex("^🕐 Schedules$"), sec_schedules))
 
